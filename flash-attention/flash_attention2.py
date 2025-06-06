@@ -709,7 +709,7 @@ if TRITON_AVAILABLE:
         # Store final dQ
         tl.store(dQ_block_ptr, dq_acc.to(dQ_block_ptr.type.element_ty), boundary_check=(0, 1))
 
-    class FlashAttentionTritonV2Function(torch.autograd.Function):
+    class FlashAttentionTritonAll(torch.autograd.Function):
         """
         Enhanced Triton implementation of FlashAttention-2 with optimized backward pass.
         This version uses Triton kernels for both forward and backward passes with online softmax.
@@ -870,4 +870,4 @@ def flash_attention_all_triton(Q, K, V, is_causal=False):
     """
     if not TRITON_AVAILABLE:
         raise RuntimeError("Triton is not available")
-    return FlashAttentionTritonV2Function.apply(Q, K, V, is_causal)
+    return FlashAttentionTritonAll.apply(Q, K, V, is_causal)

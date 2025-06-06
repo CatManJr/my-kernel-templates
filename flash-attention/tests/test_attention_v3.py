@@ -2,7 +2,7 @@ import pytest
 import torch
 from einops import einsum, rearrange
 
-from .adapters import get_flashattention_v1_autograd_function
+from .adapters import get_flashattention_v3_autograd_function
 
 
 def _attention_and_lse(q, k, v, is_causal=False):
@@ -60,7 +60,7 @@ def _test_flash_forward_pass(impl, device="cpu", is_causal=False):
 )
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_flash_forward_pass_triton(is_causal):
-    _test_flash_forward_pass(get_flashattention_v1_autograd_function().apply, device="cuda", is_causal=is_causal)
+    _test_flash_forward_pass(get_flashattention_v3_autograd_function().apply, device="cuda", is_causal=is_causal)
 
 
 
@@ -79,7 +79,7 @@ def test_flash_backward_triton(is_causal):
     dq_expected, dk_expected, dv_expected = flash_backward_results(lambda *args: _attention_and_lse(*args)[0], is_causal, device='cuda')
 
     q, k, v, do = _make_attn_inputs(device='cuda')
-    get_flashattention_v1_autograd_function().apply(q, k, v, is_causal).backward(do)
+    get_flashattention_v3_autograd_function().apply(q, k, v, is_causal).backward(do)
 
     torch.testing.assert_close(dq_expected, q.grad, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(dk_expected, k.grad, rtol=1e-2, atol=1e-2)

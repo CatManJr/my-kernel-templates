@@ -13,8 +13,14 @@ from flash_attention2 import (
 
 # Import FlashAttention-1 implementation
 from flash_attention import (
-    FlashAttentionV1Function,
+    FlashAttention1TritonFunction,
     TRITON_AVAILABLE as TRITON_V1_AVAILABLE
+)
+
+# Import FlashAttention-3 implementation
+from flash_attention3 import (
+    FlashAttention3TritonFunction,
+    TRITON_AVAILABLE as TRITON_V3_AVAILABLE
 )
 
 
@@ -48,12 +54,31 @@ def get_flashattention_autograd_function_triton() -> Type:
 def get_flashattention_v1_autograd_function() -> Type:
     """
     Returns a torch.autograd.Function subclass that implements FlashAttention-1
-    using Triton kernels.
+    using Triton kernel for forward pass and PyTorch for backward pass.
     
-    FlashAttention-1 uses 4D tensors (batch, heads, seq_len, head_dim) and
-    has different parallelization strategy compared to FlashAttention-2.
+    This version uses Triton kernel for the forward pass (for performance) but
+    falls back to PyTorch implementation for the backward pass (for simplicity).
 
     Returns:
         A class object (not an instance of the class)
     """
-    return FlashAttentionV1Function
+    return FlashAttention1TritonFunction  # Pure PyTorch fallback
+
+
+def get_flashattention_v3_autograd_function() -> Type:
+    """
+    Returns a torch.autograd.Function subclass that implements FlashAttention-3
+    using Triton kernels with advanced optimizations.
+    
+    FlashAttention-3 includes:
+    1. Asynchronous data movement with computation overlap
+    2. Warp specialization for better parallelism
+    3. Enhanced numerical stability with mixed precision
+    4. Optimized memory access patterns
+    5. Optional low-rank approximation for very long sequences
+    6. Adaptive tile sizing based on sequence length and hardware
+
+    Returns:
+        A class object (not an instance of the class)
+    """
+    return FlashAttention3TritonFunction

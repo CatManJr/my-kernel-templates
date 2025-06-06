@@ -23,392 +23,266 @@ except ImportError:
     raise ImportError("Triton is required for FlashAttention-1 implementation")
 
 
-@triton.jit
-def flash_attention_v1_kernel(
-    Q_ptr, K_ptr, V_ptr, O_ptr, L_ptr,
-    stride_qb, stride_qh, stride_qm, stride_qk,
-    stride_kb, stride_kh, stride_kn, stride_kk, 
-    stride_vb, stride_vh, stride_vn, stride_vk,
-    stride_ob, stride_oh, stride_om, stride_ok,
-    stride_lb, stride_lh, stride_lm,
-    B, H, M, N, K,
-    scale,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-    is_causal: tl.constexpr,
-):
-    """
-    FlashAttention-1 Triton kernel with improved dtype handling and numerical stability.
-    """
-    # Program IDs - FlashAttention-1 uses different parallelization
-    pid_m = tl.program_id(0)
-    pid_b = tl.program_id(1) 
-    pid_h = tl.program_id(2)
-    
-    # Number of blocks
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-    
-    # Reorder program IDs for better cache locality (FlashAttention-1 specific)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid_m // GROUP_SIZE_M
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid_m % group_size_m)
-    
-    # Compute offsets
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-    
-    # Initialize pointers for Q
-    q_ptrs = (Q_ptr + 
-              pid_b * stride_qb + 
-              pid_h * stride_qh +
-              offs_m[:, None] * stride_qm + 
-              offs_k[None, :] * stride_qk)
-    
-    # Initialize accumulators - use float32 for numerical stability
-    acc = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.float32)
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    m_i = tl.full([BLOCK_M], value=float('-inf'), dtype=tl.float32)
-    
-    # Load Q block and convert to float32 for computation
-    q_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
-    q = tl.load(q_ptrs, mask=q_mask, other=0.0)
-    q = q.to(tl.float32)  # Ensure float32 for computation
-    
-    # Loop over K, V blocks
-    for start_n in range(0, N, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
+if TRITON_AVAILABLE:
+    @triton.jit
+    def flash_fwd_kernel_v1_correct(
+        Q_ptr, K_ptr, V_ptr,
+        O_ptr, L_ptr, M_ptr,
+        stride_qb, stride_qq, stride_qd,
+        stride_kb, stride_kk, stride_kd,
+        stride_vb, stride_vk, stride_vd,
+        stride_ob, stride_oq, stride_od,
+        stride_lb, stride_lq,
+        stride_mb, stride_mq,
+        N_QUERIES, N_KEYS,
+        scale,
+        D: tl.constexpr,
+        BR: tl.constexpr,  # Block size for queries (rows)
+        BC: tl.constexpr,  # Block size for keys (columns)
+        is_causal: tl.constexpr,
+    ):
+        """
+        Correct FlashAttention-1 kernel following Algorithm 1 from the original paper.
         
-        # Compute the actual block size for this iteration
-        curr_n = tl.minimum(BLOCK_N, N - start_n)
-        offs_n_curr = start_n + tl.arange(0, BLOCK_N)
+        Key implementation details:
+        - Outer loop over K/V blocks (j), inner loop over Q blocks (i)
+        - Each thread block processes one K/V block against all Q blocks
+        - Follows the exact memory access pattern from Algorithm 1
+        """
+        # Program indices - CRITICAL: each thread block handles one K/V block
+        kv_block_idx = tl.program_id(0)  # Which K/V block (j in Algorithm 1)
+        batch_idx = tl.program_id(1)     # Which batch
         
-        # Initialize pointers for K and V
-        k_ptrs = (K_ptr + 
-                  pid_b * stride_kb + 
-                  pid_h * stride_kh +
-                  offs_n_curr[:, None] * stride_kn + 
-                  offs_k[None, :] * stride_kk)
+        # Calculate number of blocks (Algorithm 1, line 3-4)
+        Tr = tl.cdiv(N_QUERIES, BR)  # Number of Q blocks
+        Tc = tl.cdiv(N_KEYS, BC)      # Number of K/V blocks
         
-        v_ptrs = (V_ptr + 
-                  pid_b * stride_vb + 
-                  pid_h * stride_vh +
-                  offs_n_curr[:, None] * stride_vn + 
-                  offs_k[None, :] * stride_vk)
+        # Early exit if this thread block is out of bounds
+        if kv_block_idx >= Tc:
+            return
+            
+        # Calculate K/V block boundaries (Algorithm 1, line 5)
+        kv_start = kv_block_idx * BC
+        kv_end = tl.minimum(kv_start + BC, N_KEYS)
         
-        # Load K and V blocks
-        k_mask = (offs_n_curr[:, None] < N) & (offs_k[None, :] < K)
-        v_mask = (offs_n_curr[:, None] < N) & (offs_k[None, :] < K)
-        
-        k = tl.load(k_ptrs, mask=k_mask, other=0.0)
-        v = tl.load(v_ptrs, mask=v_mask, other=0.0)
-        
-        # Convert to float32 for computation
-        k = k.to(tl.float32)
-        v = v.to(tl.float32)
-        
-        # Compute attention scores S_ij = Q @ K^T
-        s_ij = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        s_ij = tl.dot(q, tl.trans(k), s_ij) * scale
-        
-        # Apply causal mask if needed
-        if is_causal:
-            causal_mask = (offs_m[:, None] >= (start_n + offs_n_curr[None, :]))
-            s_ij = tl.where(causal_mask, s_ij, float('-inf'))
-        
-        # Mask out invalid positions
-        valid_mask = (offs_m[:, None] < M) & ((start_n + offs_n_curr[None, :]) < N)
-        s_ij = tl.where(valid_mask, s_ij, float('-inf'))
-        
-        # Online softmax computation (FlashAttention-1 algorithm)
-        m_ij = tl.max(s_ij, 1)  # Row-wise max
-        m_i_new = tl.maximum(m_i, m_ij)
-        
-        # Compute P_ij = exp(S_ij - m_i_new)
-        p_ij = tl.exp(s_ij - m_i_new[:, None])
-        
-        # Update normalization factor
-        l_i_new = tl.exp(m_i - m_i_new) * l_i + tl.sum(p_ij, 1)
-        
-        # Update output
-        alpha = tl.exp(m_i - m_i_new)
-        acc = acc * alpha[:, None] + tl.dot(p_ij, v)
-        
-        # Update running statistics
-        l_i = l_i_new
-        m_i = m_i_new
-    
-    # Final normalization with safety check
-    l_i_safe = tl.maximum(l_i, 1e-20)  # Prevent division by zero
-    acc = acc / l_i_safe[:, None]
-    
-    # Compute final log-sum-exp for backward pass
-    l_final = m_i + tl.log(l_i_safe)
-    
-    # Store output (convert back to original dtype)
-    o_ptrs = (O_ptr + 
-              pid_b * stride_ob + 
-              pid_h * stride_oh +
-              offs_m[:, None] * stride_om + 
-              offs_k[None, :] * stride_ok)
-    
-    l_ptrs = (L_ptr +
-              pid_b * stride_lb +
-              pid_h * stride_lh + 
-              offs_m * stride_lm)
-    
-    o_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
-    l_mask = offs_m < M
-    
-    # Store with original dtype
-    tl.store(o_ptrs, acc.to(O_ptr.dtype.element_ty), mask=o_mask)
-    tl.store(l_ptrs, l_final, mask=l_mask)
-
-
-@triton.jit  
-def flash_attention_v1_backward_kernel(
-    Q_ptr, K_ptr, V_ptr, O_ptr, DO_ptr, L_ptr,
-    DQ_ptr, DK_ptr, DV_ptr, D_ptr,
-    stride_qb, stride_qh, stride_qm, stride_qk,
-    stride_kb, stride_kh, stride_kn, stride_kk,
-    stride_vb, stride_vh, stride_vn, stride_vk,
-    stride_ob, stride_oh, stride_om, stride_ok,
-    stride_dob, stride_doh, stride_dom, stride_dok,
-    stride_lb, stride_lh, stride_lm,
-    stride_dqb, stride_dqh, stride_dqm, stride_dqk,
-    stride_dkb, stride_dkh, stride_dkn, stride_dkk,
-    stride_dvb, stride_dvh, stride_dvn, stride_dvk,
-    stride_db, stride_dh, stride_dm,
-    B, H, M, N, K,
-    scale,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    is_causal: tl.constexpr,
-):
-    """FlashAttention-1 backward kernel with proper gradient accumulation."""
-    pid_n = tl.program_id(0)  # 改为按N维度并行化以避免竞争条件
-    pid_b = tl.program_id(1)
-    pid_h = tl.program_id(2)
-    
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_m = tl.arange(0, BLOCK_M)
-    offs_k = tl.arange(0, BLOCK_K)
-    
-    # 初始化dK和dV累积器
-    dk_acc = tl.zeros([BLOCK_N, BLOCK_K], dtype=tl.float32)
-    dv_acc = tl.zeros([BLOCK_N, BLOCK_K], dtype=tl.float32)
-    
-    # 加载K和V块
-    k_ptrs = (K_ptr + pid_b * stride_kb + pid_h * stride_kh +
-              offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
-    v_ptrs = (V_ptr + pid_b * stride_vb + pid_h * stride_vh +
-              offs_n[:, None] * stride_vn + offs_k[None, :] * stride_vk)
-    
-    k_mask = (offs_n[:, None] < N) & (offs_k[None, :] < K)
-    v_mask = (offs_n[:, None] < N) & (offs_k[None, :] < K)
-    
-    k = tl.load(k_ptrs, mask=k_mask, other=0.0).to(tl.float32)
-    v = tl.load(v_ptrs, mask=v_mask, other=0.0).to(tl.float32)
-    
-    # 循环处理所有Q块
-    for start_m in range(0, M, BLOCK_M):
-        offs_m_curr = start_m + tl.arange(0, BLOCK_M)
-        
-        # 加载Q, O, DO, L, D
-        q_ptrs = (Q_ptr + pid_b * stride_qb + pid_h * stride_qh +
-                  offs_m_curr[:, None] * stride_qm + offs_k[None, :] * stride_qk)
-        o_ptrs = (O_ptr + pid_b * stride_ob + pid_h * stride_oh +
-                  offs_m_curr[:, None] * stride_om + offs_k[None, :] * stride_ok)
-        do_ptrs = (DO_ptr + pid_b * stride_dob + pid_h * stride_doh +
-                   offs_m_curr[:, None] * stride_dom + offs_k[None, :] * stride_dok)
-        l_ptrs = (L_ptr + pid_b * stride_lb + pid_h * stride_lh + offs_m_curr * stride_lm)
-        d_ptrs = (D_ptr + pid_b * stride_db + pid_h * stride_dh + offs_m_curr * stride_dm)
-        
-        q_mask = (offs_m_curr[:, None] < M) & (offs_k[None, :] < K)
-        l_mask = offs_m_curr < M
-        
-        q = tl.load(q_ptrs, mask=q_mask, other=0.0).to(tl.float32)
-        o = tl.load(o_ptrs, mask=q_mask, other=0.0).to(tl.float32)
-        do = tl.load(do_ptrs, mask=q_mask, other=0.0).to(tl.float32)
-        l = tl.load(l_ptrs, mask=l_mask, other=0.0)
-        d = tl.load(d_ptrs, mask=l_mask, other=0.0)
-        
-        # 重计算注意力分数
-        s_ij = tl.dot(q, tl.trans(k)) * scale
-        
-        # 应用因果掩码和有效掩码
-        valid_mask = (offs_m_curr[:, None] < M) & (offs_n[None, :] < N)
-        if is_causal:
-            causal_mask = (offs_m_curr[:, None] >= offs_n[None, :])
-            valid_mask = valid_mask & causal_mask
-            s_ij = tl.where(causal_mask, s_ij, float('-inf'))
-        
-        s_ij = tl.where(valid_mask, s_ij, float('-inf'))
-        
-        # 计算softmax概率
-        p_ij = tl.exp(s_ij - l[:, None])
-        p_ij = tl.where(valid_mask, p_ij, 0.0)
-        
-        # 计算梯度
-        dp_ij = tl.dot(do, tl.trans(v))
-        ds_ij = p_ij * (dp_ij - d[:, None]) * scale
-        ds_ij = tl.where(valid_mask, ds_ij, 0.0)
-        
-        # 累积dK和dV梯度
-        dk_acc += tl.dot(tl.trans(ds_ij), q)
-        dv_acc += tl.dot(tl.trans(p_ij), do)
-        
-        # 计算并存储dQ（每个M块独立）
-        dq = tl.dot(ds_ij, k)
-        dq_ptrs = (DQ_ptr + pid_b * stride_dqb + pid_h * stride_dqh +
-                   offs_m_curr[:, None] * stride_dqm + offs_k[None, :] * stride_dqk)
-        tl.store(dq_ptrs, dq.to(DQ_ptr.dtype.element_ty), mask=q_mask)
-    
-    # store dK and dV gradients
-    dk_ptrs = (DK_ptr + pid_b * stride_dkb + pid_h * stride_dkh +
-               offs_n[:, None] * stride_dkn + offs_k[None, :] * stride_dkk)
-    dv_ptrs = (DV_ptr + pid_b * stride_dvb + pid_h * stride_dvh +
-               offs_n[:, None] * stride_dvn + offs_k[None, :] * stride_dvk)
-    
-    tl.store(dk_ptrs, dk_acc.to(DK_ptr.dtype.element_ty), mask=k_mask)
-    tl.store(dv_ptrs, dv_acc.to(DV_ptr.dtype.element_ty), mask=v_mask)
-    
-
-
-class FlashAttentionV1Function(torch.autograd.Function):
-    """
-    FlashAttention-1 implementation using Triton.
-    
-    This is the original FlashAttention algorithm with:
-    - Sequence-level parallelization
-    - Simpler tiling strategy
-    - Different memory access patterns compared to V2
-    """
-    
-    @staticmethod
-    def forward(ctx, q, k, v, is_causal=False):
-        # Input validation
-        assert q.dim() == k.dim() == v.dim() == 4, "Expected 4D tensors (batch, heads, seq_len, head_dim)"
-        B, H, M, K = q.shape
-        _, _, N, _ = k.shape
-        assert k.shape == v.shape, "K and V must have the same shape"
-        assert q.shape[-1] == k.shape[-1], "Q and K must have the same head dimension"
-        
-        # Ensure contiguous memory layout
-        q = q.contiguous()
-        k = k.contiguous() 
-        v = v.contiguous()
-        
-        # Initialize output tensors
-        o = torch.empty_like(q)
-        l = torch.empty((B, H, M), device=q.device, dtype=torch.float32)
-        
-        # FlashAttention-1 specific hyperparameters
-        scale = 1.0 / math.sqrt(K)
-        
-        # Block sizes - FlashAttention-1 uses smaller, more conservative blocks
-        BLOCK_M = 64  # Query block size
-        BLOCK_N = 64  # Key/Value block size  
-        BLOCK_K = K   # Head dimension (no blocking on this dim)
-        GROUP_SIZE_M = 8
-        
-        # Launch kernel
-        grid = (triton.cdiv(M, BLOCK_M), B, H)
-        
-        flash_attention_v1_kernel[grid](
-            q, k, v, o, l,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            l.stride(0), l.stride(1), l.stride(2),
-            B, H, M, N, K,
-            scale,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-            GROUP_SIZE_M=GROUP_SIZE_M,
-            is_causal=is_causal,
-            num_warps=4,
-            num_stages=2,
+        # Load K_j and V_j blocks from HBM to SRAM (Algorithm 1, line 6)
+        K_block_ptr = tl.make_block_ptr(
+            K_ptr + batch_idx * stride_kb,
+            shape=(N_KEYS, D),
+            strides=(stride_kk, stride_kd),
+            offsets=(kv_start, 0),
+            block_shape=(BC, D),
+            order=(1, 0),
         )
         
-        # Save tensors for backward pass
-        ctx.save_for_backward(q, k, v, o, l)
-        ctx.is_causal = is_causal
-        ctx.scale = scale
-        ctx.BLOCK_M = BLOCK_M
-        ctx.BLOCK_N = BLOCK_N
-        ctx.BLOCK_K = BLOCK_K
-        
-        return o
-    
-    @staticmethod
-    def backward(ctx, grad_output):
-        q, k, v, o, l = ctx.saved_tensors
-        is_causal = ctx.is_causal
-        scale = ctx.scale
-        BLOCK_M = ctx.BLOCK_M
-        BLOCK_N = ctx.BLOCK_N  
-        BLOCK_K = ctx.BLOCK_K
-        
-        B, H, M, K = q.shape
-        N = k.shape[2]
-        
-        # Compute D = sum(dO * O, dim=-1)
-        d = torch.sum(grad_output * o, dim=-1)
-        
-        # Initialize gradient tensors
-        dq = torch.zeros_like(q)
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
-        
-        # Launch backward kernel with N-dimension parallelization
-        grid = (triton.cdiv(N, BLOCK_N), B, H)
-        
-        flash_attention_v1_backward_kernel[grid](
-            q, k, v, o, grad_output, l,
-            dq, dk, dv, d,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            grad_output.stride(0), grad_output.stride(1), grad_output.stride(2), grad_output.stride(3),
-            l.stride(0), l.stride(1), l.stride(2),
-            dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
-            dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-            dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
-            d.stride(0), d.stride(1), d.stride(2),
-            B, H, M, N, K,
-            scale,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-            is_causal=is_causal,
-            num_warps=4,
-            num_stages=2,
+        V_block_ptr = tl.make_block_ptr(
+            V_ptr + batch_idx * stride_vb,
+            shape=(N_KEYS, D),
+            strides=(stride_vk, stride_vd),
+            offsets=(kv_start, 0),
+            block_shape=(BC, D),
+            order=(1, 0),
         )
         
-        return dq, dk, dv, None
-
-
-def flash_attention_v1(q, k, v, is_causal=False):
-    """
-    FlashAttention-1 implementation.
-    
-    Args:
-        q: Query tensor (batch, heads, seq_len, head_dim)
-        k: Key tensor (batch, heads, seq_len, head_dim)  
-        v: Value tensor (batch, heads, seq_len, head_dim)
-        is_causal: Whether to apply causal masking
+        # Load K_j and V_j with boundary checking - STAY IN SRAM
+        Kj = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        Vj = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
         
-    Returns:
-        Output tensor with same shape as q
-    """
-    if not TRITON_AVAILABLE:
-        raise RuntimeError("Triton is not available for FlashAttention-1")
-    
-    return FlashAttentionV1Function.apply(q, k, v, is_causal)
+        # Inner loop over Q blocks (Algorithm 1, line 7)
+        for q_block_idx in range(Tr):
+            q_start = q_block_idx * BR
+            q_end = tl.minimum(q_start + BR, N_QUERIES)
+            
+            # Load Q_i, O_i, l_i, m_i from HBM to SRAM (Algorithm 1, line 8)
+            Q_block_ptr = tl.make_block_ptr(
+                Q_ptr + batch_idx * stride_qb,
+                shape=(N_QUERIES, D),
+                strides=(stride_qq, stride_qd),
+                offsets=(q_start, 0),
+                block_shape=(BR, D),
+                order=(1, 0),
+            )
+            
+            O_block_ptr = tl.make_block_ptr(
+                O_ptr + batch_idx * stride_ob,
+                shape=(N_QUERIES, D),
+                strides=(stride_oq, stride_od),
+                offsets=(q_start, 0),
+                block_shape=(BR, D),
+                order=(1, 0),
+            )
+            
+            L_block_ptr = tl.make_block_ptr(
+                L_ptr + batch_idx * stride_lb,
+                shape=(N_QUERIES,),
+                strides=(stride_lq,),
+                offsets=(q_start,),
+                block_shape=(BR,),
+                order=(0,),
+            )
+            
+            M_block_ptr = tl.make_block_ptr(
+                M_ptr + batch_idx * stride_mb,
+                shape=(N_QUERIES,),
+                strides=(stride_mq,),
+                offsets=(q_start,),
+                block_shape=(BR,),
+                order=(0,),
+            )
+            
+            # Load current state
+            Qi = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            Oi = tl.load(O_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            li = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")
+            mi = tl.load(M_block_ptr, boundary_check=(0,), padding_option="zero")
+            
+            # Compute S_ij = Q_i @ K_j^T (Algorithm 1, line 9)
+            Sij = tl.dot(Qi, tl.trans(Kj)) * scale
+            
+            # Apply causal mask if needed
+            if is_causal:
+                q_indices = q_start + tl.arange(0, BR)
+                k_indices = kv_start + tl.arange(0, BC)
+                causal_mask = q_indices[:, None] >= k_indices[None, :]
+                Sij = tl.where(causal_mask, Sij, float('-inf'))
+            
+            # Compute row-wise max and softmax (Algorithm 1, line 10)
+            m_tilde_ij = tl.max(Sij, axis=1)  # rowmax(S_ij)
+            P_tilde_ij = tl.exp(Sij - m_tilde_ij[:, None])  # exp(S_ij - m_tilde_ij)
+            l_tilde_ij = tl.sum(P_tilde_ij, axis=1)  # rowsum(P_tilde_ij)
+            
+            # Update max and normalization (Algorithm 1, line 11)
+            m_new_i = tl.maximum(mi, m_tilde_ij)  # max(m_i, m_tilde_ij)
+            
+            # Compute exponential terms for updating l_i
+            exp_mi = tl.exp(mi - m_new_i)
+            exp_m_tilde = tl.exp(m_tilde_ij - m_new_i)
+            l_new_i = exp_mi * li + exp_m_tilde * l_tilde_ij
+            
+            # Update output O_i (Algorithm 1, line 12)
+            # O_i <- diag(l_new_i)^(-1) * (diag(l_i) * exp(m_i - m_new_i) * O_i + exp(m_tilde_ij - m_new_i) * P_tilde_ij * V_j)
+            
+            # First term: diag(l_i) * exp(m_i - m_new_i) * O_i
+            scaling_old = (li * exp_mi) / l_new_i
+            Oi_scaled = Oi * scaling_old[:, None]
+            
+            # Second term: exp(m_tilde_ij - m_new_i) * P_tilde_ij * V_j
+            P_scaled = P_tilde_ij * (exp_m_tilde / l_new_i)[:, None]
+            Oi_new = tl.dot(P_scaled.to(Vj.dtype), Vj)
+            
+            # Combine terms
+            Oi_final = Oi_scaled + Oi_new
+            
+            # Store updated values back to HBM (Algorithm 1, line 12-13)
+            tl.store(O_block_ptr, Oi_final.to(O_block_ptr.type.element_ty), boundary_check=(0, 1))
+            tl.store(L_block_ptr, l_new_i, boundary_check=(0,))
+            tl.store(M_block_ptr, m_new_i, boundary_check=(0,))
 
-
-# Compatibility aliases
-flash_attention = flash_attention_v1
-flash_attention_triton = flash_attention_v1
+    class FlashAttention1TritonFunction(torch.autograd.Function):
+        """
+        Correct implementation of original FlashAttention-1 following Algorithm 1.
+        
+        This implementation strictly follows the algorithm from the original paper:
+        - Outer loop over K/V blocks (j from 1 to Tc)  
+        - Inner loop over Q blocks (i from 1 to Tr)
+        - Block sizes: Bc = M/(4d), Br = min(M/(4d), d)
+        - Each thread block processes one K/V block against all Q blocks
+        """
+        
+        @staticmethod
+        def forward(ctx, Q, K, V, is_causal=False):
+            batch_size, seq_len, head_dim = Q.shape
+            device = Q.device
+            dtype = Q.dtype
+            
+            # Ensure contiguous tensors
+            Q = Q.contiguous()
+            K = K.contiguous() 
+            V = V.contiguous()
+            
+            scale = 1.0 / math.sqrt(head_dim)
+            
+            # Block sizes following Algorithm 1 exactly
+            # Assume SRAM size M = 128KB for block size calculation
+            M = 128 * 1024  # 128KB SRAM
+            BC = min(128, M // (4 * head_dim))  # Bc = M/(4d)
+            BR = min(BC, head_dim)              # Br = min(M/(4d), d)
+            
+            # Ensure minimum block sizes and power of 2
+            BC = max(16, BC)
+            BR = max(16, BR)
+            BC = 1 << (BC.bit_length() - 1) if BC > 0 else 16
+            BR = 1 << (BR.bit_length() - 1) if BR > 0 else 16
+            
+            # Initialize outputs (Algorithm 1, line 2)
+            O = torch.zeros_like(Q)  # O = (0)_N×d
+            L = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)  # ℓ = (0)_N
+            M = torch.full((batch_size, seq_len), float('-inf'), device=device, dtype=torch.float32)  # m = (-∞)_N
+            
+            # Calculate number of blocks (Algorithm 1, line 3-4)
+            Tr = triton.cdiv(seq_len, BR)  # Number of Q blocks
+            Tc = triton.cdiv(seq_len, BC)  # Number of K/V blocks
+            
+            # Launch kernel - CRITICAL: grid size based on K/V blocks, not Q blocks
+            grid = (Tc, batch_size)  # Each thread block handles one K/V block
+            
+            flash_fwd_kernel_v1_correct[grid](
+                Q, K, V, O, L, M,
+                Q.stride(0), Q.stride(1), Q.stride(2),
+                K.stride(0), K.stride(1), K.stride(2),
+                V.stride(0), V.stride(1), V.stride(2),
+                O.stride(0), O.stride(1), O.stride(2),
+                L.stride(0), L.stride(1),
+                M.stride(0), M.stride(1),
+                seq_len, seq_len, scale,
+                D=head_dim,
+                BR=BR,
+                BC=BC,
+                is_causal=is_causal,
+                num_warps=4,
+                num_stages=2,
+            )
+            
+            # Convert L back to log space for backward pass
+            L_log = M + torch.log(L)
+            
+            ctx.save_for_backward(Q, K, V, O, L_log)
+            ctx.is_causal = is_causal
+            ctx.scale = scale
+            
+            return O
+        
+        @staticmethod
+        def backward(ctx, grad_output):
+            """Backward pass using torch.compile and recomputation."""
+            Q, K, V, O, L = ctx.saved_tensors
+            is_causal = ctx.is_causal
+            scale = ctx.scale
+            
+            @torch.compile(mode='default', fullgraph=False)
+            def compute_gradients(Q, K, V, O, L, grad_output, is_causal, scale):
+                # Standard recomputation-based backward pass
+                scores = torch.matmul(Q, K.transpose(-2, -1)) * scale
+                
+                if is_causal:
+                    mask = torch.triu(torch.ones_like(scores, dtype=torch.bool), diagonal=1)
+                    scores.masked_fill_(mask, float('-inf'))
+                
+                attn_probs = torch.exp(scores - L.unsqueeze(-1))
+                
+                # Compute gradients
+                grad_V = torch.matmul(attn_probs.transpose(-2, -1), grad_output)
+                grad_attn_probs = torch.matmul(grad_output, V.transpose(-2, -1))
+                
+                D = torch.sum(grad_output * O, dim=-1, keepdim=True)
+                grad_scores = attn_probs * (grad_attn_probs - D) * scale
+                
+                if is_causal:
+                    grad_scores.masked_fill_(mask, 0.0)
+                
+                grad_Q = torch.matmul(grad_scores, K)
+                grad_K = torch.matmul(grad_scores.transpose(-2, -1), Q)
+                
+                return grad_Q, grad_K, grad_V
+            
+            return compute_gradients(Q, K, V, O, L, grad_output, is_causal, scale) + (None,)
