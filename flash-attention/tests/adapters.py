@@ -11,6 +11,12 @@ from flash_attention2 import (
     TRITON_AVAILABLE
 )
 
+# Import FlashAttention-1 implementation
+from flash_attention import (
+    FlashAttentionV1Function,
+    TRITON_AVAILABLE as TRITON_V1_AVAILABLE
+)
+
 
 def get_flashattention_autograd_function_pytorch() -> Type:
     """
@@ -37,3 +43,17 @@ def get_flashattention_autograd_function_triton() -> Type:
         A class object (not an instance of the class)
     """
     return FlashAttentionTritonFunction
+
+
+def get_flashattention_v1_autograd_function() -> Type:
+    """
+    Returns a torch.autograd.Function subclass that implements FlashAttention-1
+    using Triton kernels.
+    
+    FlashAttention-1 uses 4D tensors (batch, heads, seq_len, head_dim) and
+    has different parallelization strategy compared to FlashAttention-2.
+
+    Returns:
+        A class object (not an instance of the class)
+    """
+    return FlashAttentionV1Function
