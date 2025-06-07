@@ -509,208 +509,660 @@ if TRITON_AVAILABLE:
             
             return dQ, dK, dV, None
 
+    #triton kernel for backward pass
     @triton.jit
-    def flash_bwd_kernel_v2(
-        Q_ptr, K_ptr, V_ptr, O_ptr, dO_ptr, L_ptr, D_ptr,
-        dQ_ptr, dK_ptr, dV_ptr,
-        stride_qb, stride_qq, stride_qd,
-        stride_kb, stride_kk, stride_kd,
-        stride_vb, stride_vk, stride_vd,
-        stride_ob, stride_oq, stride_od,
-        stride_dob, stride_doq, stride_dod,
-        stride_lb, stride_lq,
-        stride_db, stride_dq_idx,
-        stride_dqb, stride_dqq, stride_dqd,
-        stride_dkb, stride_dkk, stride_dkd,
-        stride_dvb, stride_dvk, stride_dvd,
-        N_QUERIES, N_KEYS,
-        scale,
-        D: tl.constexpr,
-        Q_TILE_SIZE: tl.constexpr,
-        K_TILE_SIZE: tl.constexpr,
-        is_causal: tl.constexpr,
+    def _bwd_preprocess_do_o_dot(
+        Out,
+        DO,
+        Delta,
+        stride_ob,
+        stride_oh,
+        stride_om,
+        stride_dob,
+        stride_doh,
+        stride_dom,
+        nheads,
+        seqlen_q,
+        seqlen_q_rounded,
+        headdim,
+        BLOCK_M: tl.constexpr,
+        BLOCK_HEADDIM: tl.constexpr,
     ):
-        """
-        Algorithm 2: Tiled FlashAttention-2 backward pass
-        
-        Key insight: Compute P twice to avoid synchronization:
-        - Once for dQ computation 
-        - Once for dK and dV computation
-        
-        This implementation follows the exact algorithm structure where:
-        1. Outer loop over K/V tiles (j)
-        2. Inner loop over Q tiles (i) 
-        3. Atomic updates for dQ accumulation
-        """
-        # This kernel processes one K/V tile (j-th tile)
-        k_tile_id = tl.program_id(0)  # j in algorithm
-        batch_id = tl.program_id(1)
-        
-        # Calculate K/V tile boundaries
-        k_start = k_tile_id * K_TILE_SIZE
-        k_end = tl.minimum(k_start + K_TILE_SIZE, N_KEYS)
-        
-        # Load K(j) and V(j) tiles - done once per kernel
-        K_block_ptr = tl.make_block_ptr(
-            K_ptr + batch_id * stride_kb,
-            shape=(N_KEYS, D),
-            strides=(stride_kk, stride_kd),
-            offsets=(k_start, 0),
-            block_shape=(K_TILE_SIZE, D),
-            order=(1, 0),
+        start_m = tl.program_id(0)
+        off_hb = tl.program_id(1)
+        off_b = off_hb // nheads
+        off_h = off_hb % nheads
+        # initialize offsets
+        offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, BLOCK_HEADDIM)
+        # load
+        o = tl.load(
+            Out + off_b * stride_ob + off_h * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :],
+            mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+            other=0.0,
+        ).to(tl.float32)
+        do = tl.load(
+            DO
+            + off_b * stride_dob
+            + off_h * stride_doh
+            + offs_m[:, None] * stride_dom
+            + offs_d[None, :],
+            mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+            other=0.0,
+        ).to(tl.float32)
+        delta = tl.sum(o * do, axis=1)
+        # write-back
+        tl.store(Delta + off_hb * seqlen_q_rounded + offs_m, delta)
+
+
+    @triton.jit
+    def _bwd_store_dk_dv(
+        dk_ptrs,
+        dv_ptrs,
+        dk,
+        dv,
+        offs_n,
+        offs_d,
+        seqlen_k,
+        headdim,
+        EVEN_M: tl.constexpr,
+        EVEN_N: tl.constexpr,
+        EVEN_HEADDIM: tl.constexpr,
+    ):
+        # [2022-11-01] TD: Same bug. In the case of EVEN_N=True and EVEN_M=False,
+        # if we just call tl.store(dv_ptrs), there's a race condition
+        if EVEN_N & EVEN_M:
+            if EVEN_HEADDIM:
+                tl.store(dv_ptrs, dv)
+                tl.store(dk_ptrs, dk)
+            else:
+                tl.store(dv_ptrs, dv, mask=offs_d[None, :] < headdim)
+                tl.store(dk_ptrs, dk, mask=offs_d[None, :] < headdim)
+        else:
+            if EVEN_HEADDIM:
+                tl.store(dv_ptrs, dv, mask=offs_n[:, None] < seqlen_k)
+                tl.store(dk_ptrs, dk, mask=offs_n[:, None] < seqlen_k)
+            else:
+                tl.store(dv_ptrs, dv, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim))
+                tl.store(dk_ptrs, dk, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim))
+
+    # copied from flash_attn_triton.py - Dao AILab
+    @triton.jit
+    def _bwd_kernel_one_col_block(
+        start_n,
+        Q,
+        K,
+        V,
+        Bias,
+        DO,
+        DQ,
+        DK,
+        DV,
+        LSE,
+        D,
+        softmax_scale,
+        stride_qm,
+        stride_kn,
+        stride_vn,
+        stride_bm,
+        stride_dom,
+        stride_dqm,
+        stride_dkn,
+        stride_dvn,
+        seqlen_q,
+        seqlen_k,
+        headdim,
+        ATOMIC_ADD: tl.constexpr,
+        BIAS_TYPE: tl.constexpr,
+        IS_CAUSAL: tl.constexpr,
+        BLOCK_HEADDIM: tl.constexpr,
+        EVEN_M: tl.constexpr,
+        EVEN_N: tl.constexpr,
+        EVEN_HEADDIM: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        # We need to make sure begin_m is a multiple of BLOCK_M (not BLOCK_N)
+        begin_m = 0 if not IS_CAUSAL else ((start_n * BLOCK_N) // BLOCK_M) * BLOCK_M
+        # initialize row/col offsets
+        offs_qm = begin_m + tl.arange(0, BLOCK_M)
+        offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, BLOCK_HEADDIM)
+        # initialize pointers to value-like data
+        q_ptrs = Q + (offs_qm[:, None] * stride_qm + offs_d[None, :])
+        k_ptrs = K + (offs_n[:, None] * stride_kn + offs_d[None, :])
+        v_ptrs = V + (offs_n[:, None] * stride_vn + offs_d[None, :])
+        do_ptrs = DO + (offs_qm[:, None] * stride_dom + offs_d[None, :])
+        dq_ptrs = DQ + (offs_qm[:, None] * stride_dqm + offs_d[None, :])
+        if BIAS_TYPE == "vector":
+            b_ptrs = Bias + offs_n
+        elif BIAS_TYPE == "matrix":
+            b_ptrs = Bias + (offs_qm[:, None] * stride_bm + offs_n[None, :])
+        # initialize dv and dk
+        dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
+        dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
+        # There seems to be some problem with Triton pipelining that makes results wrong for
+        # headdim=64, seqlen=(113, 255), bias_type='matrix'. In this case the for loop
+        # may have zero step, and pipelining with the bias matrix could screw it up.
+        # So we just exit early.
+        if begin_m >= seqlen_q:
+            dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
+            dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
+            _bwd_store_dk_dv(
+                dk_ptrs,
+                dv_ptrs,
+                dk,
+                dv,
+                offs_n,
+                offs_d,
+                seqlen_k,
+                headdim,
+                EVEN_M=EVEN_M,
+                EVEN_N=EVEN_N,
+                EVEN_HEADDIM=EVEN_HEADDIM,
+            )
+            return
+        # k and v stay in SRAM throughout
+        # [2022-10-30] TD: Same bug as the fwd. In the case of EVEN_N=True and EVEN_M=False,
+        # if we just call tl.load(k_ptrs), we get the wrong output!
+        if EVEN_N & EVEN_M:
+            if EVEN_HEADDIM:
+                k = tl.load(k_ptrs)
+                v = tl.load(v_ptrs)
+            else:
+                k = tl.load(k_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
+                v = tl.load(v_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
+        else:
+            if EVEN_HEADDIM:
+                k = tl.load(k_ptrs, mask=offs_n[:, None] < seqlen_k, other=0.0)
+                v = tl.load(v_ptrs, mask=offs_n[:, None] < seqlen_k, other=0.0)
+            else:
+                k = tl.load(
+                    k_ptrs, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim), other=0.0
+                )
+                v = tl.load(
+                    v_ptrs, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim), other=0.0
+                )
+        # loop over rows
+        num_block_m = tl.cdiv(seqlen_q, BLOCK_M)
+        for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
+            start_m = tl.multiple_of(start_m, BLOCK_M)
+            offs_m_curr = start_m + offs_m
+            # load q, k, v, do on-chip
+            # Same bug as below. Otherwise gives wrong result for headdim=40, seqlen=(128, 117)
+            if EVEN_M & EVEN_HEADDIM:
+                q = tl.load(q_ptrs)
+            else:
+                if EVEN_HEADDIM:
+                    q = tl.load(q_ptrs, mask=offs_m_curr[:, None] < seqlen_q, other=0.0)
+                else:
+                    q = tl.load(
+                        q_ptrs,
+                        mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+                        other=0.0,
+                    )
+            # recompute p = softmax(qk, dim=-1).T
+            # 修复：使用tl.trans()替代trans_b=True
+            qk = tl.dot(q, tl.trans(k))
+            # Trying to combine the two masks seem to make the result wrong
+            if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
+                qk = tl.where(offs_n[None, :] < seqlen_k, qk, float("-inf"))
+            if IS_CAUSAL:
+                qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), qk, float("-inf"))
+            if BIAS_TYPE != "none":
+                tl.debug_barrier()  # Race condition otherwise
+                if BIAS_TYPE == "vector":
+                    if EVEN_N:
+                        bias = tl.load(b_ptrs).to(tl.float32)
+                    else:
+                        bias = tl.load(b_ptrs, mask=offs_n < seqlen_k, other=0.0).to(tl.float32)
+                    bias = bias[None, :]
+                elif BIAS_TYPE == "matrix":
+                    if EVEN_M & EVEN_N:
+                        bias = tl.load(b_ptrs).to(tl.float32)
+                    else:
+                        bias = tl.load(
+                            b_ptrs,
+                            mask=(offs_m_curr[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k),
+                            other=0.0,
+                        ).to(tl.float32)
+                qk = qk * softmax_scale + bias
+            # There seems to be a race condition when headdim=48/96, and dq, dk, dv are wrong.
+            # Also wrong for headdim=64.
+            if not (EVEN_M & EVEN_HEADDIM):
+                tl.debug_barrier()
+            lse_i = tl.load(LSE + offs_m_curr)
+            if BIAS_TYPE == "none":
+                p = tl.exp(qk * softmax_scale - lse_i[:, None])
+            else:
+                p = tl.exp(qk - lse_i[:, None])
+            # compute dv
+            # [2022-10-30] TD: A Triton bug: if EVEN_M=True and EVEN_HEADDIM=False, if we call
+            # do = tl.load(do_ptrs, mask=offs_d[None, :] < headdim, other=0.0), we get wrong outputs
+            # in the case of headdim=48/96, seqlen_q & seqlen_k >= 512. If headdim=40 or seqlen < 512,
+            # the output is correct.
+            if EVEN_M & EVEN_HEADDIM:
+                do = tl.load(do_ptrs)
+            else:
+                # [2022-11-01] TD: Triton bug, there's a race condition if we just use m_mask and not d_mask.
+                do = tl.load(
+                    do_ptrs,
+                    mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+                    other=0.0,
+                )
+            # if EVEN_M:
+            #     if EVEN_HEADDIM:
+            #         do = tl.load(do_ptrs)
+            #     else:
+            #         do = tl.load(do_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
+            # else:
+            #     if EVEN_HEADDIM:
+            #         do = tl.load(do_ptrs, mask=offs_m_curr[:, None] < seqlen_q, other=0.0)
+            #     else:
+            #         do = tl.load(do_ptrs, mask=(offs_m_curr[:, None] < seqlen_q)
+            #                                    & (offs_d[None, :] < headdim), other=0.0)
+            # 修复：使用tl.trans()替代trans_a=True
+            dv += tl.dot(tl.trans(p.to(do.dtype)), do)
+            # compute dp = dot(v, do)
+            # There seems to be a race condition when headdim=48/96, and dq, dk are wrong.
+            # Also wrong for headdim=128, seqlen=(108, 256), and ATOMIC_ADD=True
+            # Also wrong for headdim=64, seqlen=(1023, 1024), and ATOMIC_ADD=False
+            if not (EVEN_M & EVEN_HEADDIM):
+                tl.debug_barrier()
+            # 修复：使用tl.trans()替代trans_b=True
+            dp = tl.dot(do, tl.trans(v))
+            # There's a race condition for headdim=48
+            if not EVEN_HEADDIM:
+                tl.debug_barrier()
+            # compute ds = p * (dp - delta[:, None])
+            # Putting the subtraction after the dp matmul (instead of before) is slightly faster
+            Di = tl.load(D + offs_m_curr)
+            # Converting ds to q.dtype here reduces register pressure and makes it much faster
+            # for BLOCK_HEADDIM=128
+            ds = (p * (dp - Di[:, None]) * softmax_scale).to(q.dtype)
+            # compute dk = dot(ds.T, q)
+            # 修复：使用tl.trans()替代trans_a=True
+            dk += tl.dot(tl.trans(ds), q)
+            # compute dq
+            if not (
+                EVEN_M & EVEN_HEADDIM
+            ):  # Otherewise there's a race condition when BIAS_TYPE='matrix'
+                tl.debug_barrier()
+            if not ATOMIC_ADD:
+                if EVEN_M & EVEN_HEADDIM:  # Race condition if we just do EVEN_M
+                    dq = tl.load(dq_ptrs, eviction_policy="evict_last")
+                    dq += tl.dot(ds, k)
+                    tl.store(dq_ptrs, dq, eviction_policy="evict_last")
+                else:
+                    if EVEN_HEADDIM:
+                        dq = tl.load(
+                            dq_ptrs,
+                            mask=offs_m_curr[:, None] < seqlen_q,
+                            other=0.0,
+                            eviction_policy="evict_last",
+                        )
+                        dq += tl.dot(ds, k)
+                        tl.store(
+                            dq_ptrs,
+                            dq,
+                            mask=offs_m_curr[:, None] < seqlen_q,
+                            eviction_policy="evict_last",
+                        )
+                    else:
+                        dq = tl.load(
+                            dq_ptrs,
+                            mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+                            other=0.0,
+                            eviction_policy="evict_last",
+                        )
+                        dq += tl.dot(ds, k)
+                        tl.store(
+                            dq_ptrs,
+                            dq,
+                            mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+                            eviction_policy="evict_last",
+                        )
+            else:  # If we're parallelizing across the seqlen_k dimension
+                dq = tl.dot(ds, k)
+                if EVEN_M & EVEN_HEADDIM:  # Race condition if we just do EVEN_M
+                    tl.atomic_add(dq_ptrs, dq)
+                else:
+                    if EVEN_HEADDIM:
+                        tl.atomic_add(dq_ptrs, dq, mask=offs_m_curr[:, None] < seqlen_q)
+                    else:
+                        tl.atomic_add(
+                            dq_ptrs,
+                            dq,
+                            mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+                        )
+            # increment pointers
+            dq_ptrs += BLOCK_M * stride_dqm
+            q_ptrs += BLOCK_M * stride_qm
+            do_ptrs += BLOCK_M * stride_dom
+            if BIAS_TYPE == "matrix":
+                b_ptrs += BLOCK_M * stride_bm
+        # write-back
+        dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
+        dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
+        _bwd_store_dk_dv(
+            dk_ptrs,
+            dv_ptrs,
+            dk,
+            dv,
+            offs_n,
+            offs_d,
+            seqlen_k,
+            headdim,
+            EVEN_M=EVEN_M,
+            EVEN_N=EVEN_N,
+            EVEN_HEADDIM=EVEN_HEADDIM,
         )
-        
-        V_block_ptr = tl.make_block_ptr(
-            V_ptr + batch_id * stride_vb,
-            shape=(N_KEYS, D),
-            strides=(stride_vk, stride_vd),
-            offsets=(k_start, 0),
-            block_shape=(K_TILE_SIZE, D),
-            order=(1, 0),
+
+
+    def init_to_zero(name):
+        return lambda nargs: nargs[name].zero_()
+
+
+    @triton.autotune(
+        configs=[
+            triton.Config(
+                {"BLOCK_M": 64, "BLOCK_N": 64, "SEQUENCE_PARALLEL": False},
+                num_warps=4,
+                num_stages=1,
+                pre_hook=init_to_zero("DQ"),
+            ),
+            triton.Config(
+                {"BLOCK_M": 64, "BLOCK_N": 64, "SEQUENCE_PARALLEL": True},
+                num_warps=4,
+                num_stages=1,
+                pre_hook=init_to_zero("DQ"),
+            ),
+            triton.Config(
+                {"BLOCK_M": 32, "BLOCK_N": 64, "SEQUENCE_PARALLEL": False},
+                num_warps=2,
+                num_stages=1,
+                pre_hook=init_to_zero("DQ"),
+            ),
+            triton.Config(
+                {"BLOCK_M": 64, "BLOCK_N": 32, "SEQUENCE_PARALLEL": False},
+                num_warps=2,
+                num_stages=1,
+                pre_hook=init_to_zero("DQ"),
+            ),
+        ],
+        key=["CACHE_KEY_SEQLEN_Q", "CACHE_KEY_SEQLEN_K", "BIAS_TYPE", "IS_CAUSAL", "BLOCK_HEADDIM"],
+    )
+    
+    @triton.heuristics(
+        {
+            "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
+            "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
+            "EVEN_HEADDIM": lambda args: args["headdim"] == args["BLOCK_HEADDIM"],
+        }
+    )
+    
+    @triton.jit
+    def _bwd_kernel(
+        Q,
+        K,
+        V,
+        Bias,
+        DO,
+        DQ,
+        DK,
+        DV,
+        LSE,
+        D,
+        softmax_scale,
+        stride_qb,
+        stride_qh,
+        stride_qm,
+        stride_kb,
+        stride_kh,
+        stride_kn,
+        stride_vb,
+        stride_vh,
+        stride_vn,
+        stride_bb,
+        stride_bh,
+        stride_bm,
+        stride_dob,
+        stride_doh,
+        stride_dom,
+        stride_dqb,
+        stride_dqh,
+        stride_dqm,
+        stride_dkb,
+        stride_dkh,
+        stride_dkn,
+        stride_dvb,
+        stride_dvh,
+        stride_dvn,
+        nheads,
+        seqlen_q,
+        seqlen_k,
+        seqlen_q_rounded,
+        headdim,
+        CACHE_KEY_SEQLEN_Q,
+        CACHE_KEY_SEQLEN_K,
+        BIAS_TYPE: tl.constexpr,
+        IS_CAUSAL: tl.constexpr,
+        BLOCK_HEADDIM: tl.constexpr,
+        SEQUENCE_PARALLEL: tl.constexpr,
+        EVEN_M: tl.constexpr,
+        EVEN_N: tl.constexpr,
+        EVEN_HEADDIM: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        off_hb = tl.program_id(1)
+        off_b = off_hb // nheads
+        off_h = off_hb % nheads
+        # offset pointers for batch/head
+        Q += off_b * stride_qb + off_h * stride_qh
+        K += off_b * stride_kb + off_h * stride_kh
+        V += off_b * stride_vb + off_h * stride_vh
+        DO += off_b * stride_dob + off_h * stride_doh
+        DQ += off_b * stride_dqb + off_h * stride_dqh
+        DK += off_b * stride_dkb + off_h * stride_dkh
+        DV += off_b * stride_dvb + off_h * stride_dvh
+        if BIAS_TYPE != "none":
+            Bias += off_b * stride_bb + off_h * stride_bh
+        # pointer to row-wise quantities in value-like data
+        D += off_hb * seqlen_q_rounded
+        LSE += off_hb * seqlen_q_rounded
+        if not SEQUENCE_PARALLEL:
+            num_block_n = tl.cdiv(seqlen_k, BLOCK_N)
+            for start_n in range(0, num_block_n):
+                _bwd_kernel_one_col_block(
+                    start_n,
+                    Q,
+                    K,
+                    V,
+                    Bias,
+                    DO,
+                    DQ,
+                    DK,
+                    DV,
+                    LSE,
+                    D,
+                    softmax_scale,
+                    stride_qm,
+                    stride_kn,
+                    stride_vn,
+                    stride_bm,
+                    stride_dom,
+                    stride_dqm,
+                    stride_dkn,
+                    stride_dvn,
+                    seqlen_q,
+                    seqlen_k,
+                    headdim,
+                    ATOMIC_ADD=False,
+                    BIAS_TYPE=BIAS_TYPE,
+                    IS_CAUSAL=IS_CAUSAL,
+                    BLOCK_HEADDIM=BLOCK_HEADDIM,
+                    EVEN_M=EVEN_M,
+                    EVEN_N=EVEN_N,
+                    EVEN_HEADDIM=EVEN_HEADDIM,
+                    BLOCK_M=BLOCK_M,
+                    BLOCK_N=BLOCK_N,
+                )
+        else:
+            start_n = tl.program_id(0)
+            _bwd_kernel_one_col_block(
+                start_n,
+                Q,
+                K,
+                V,
+                Bias,
+                DO,
+                DQ,
+                DK,
+                DV,
+                LSE,
+                D,
+                softmax_scale,
+                stride_qm,
+                stride_kn,
+                stride_vn,
+                stride_bm,
+                stride_dom,
+                stride_dqm,
+                stride_dkn,
+                stride_dvn,
+                seqlen_q,
+                seqlen_k,
+                headdim,
+                ATOMIC_ADD=True,
+                BIAS_TYPE=BIAS_TYPE,
+                IS_CAUSAL=IS_CAUSAL,
+                BLOCK_HEADDIM=BLOCK_HEADDIM,
+                EVEN_M=EVEN_M,
+                EVEN_N=EVEN_N,
+                EVEN_HEADDIM=EVEN_HEADDIM,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+            )
+            
+    def _flash_attn_backward(
+        do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=False, softmax_scale=None
+    ):
+        # Make sure that the last dimension is contiguous
+        if do.stride(-1) != 1:
+            do = do.contiguous()
+        batch, seqlen_q, nheads, d = q.shape
+        _, seqlen_k, _, _ = k.shape
+        # assert d in {16, 32, 64, 128}
+        assert d <= 128
+        seqlen_q_rounded = math.ceil(seqlen_q / 128) * 128
+        assert lse.shape == (batch, nheads, seqlen_q_rounded)
+        assert q.stride(-1) == k.stride(-1) == v.stride(-1) == o.stride(-1) == 1
+        assert dq.stride(-1) == dk.stride(-1) == dv.stride(-1) == 1
+        softmax_scale = softmax_scale or 1.0 / math.sqrt(d)
+        # dq_accum = torch.zeros_like(q, dtype=torch.float32)
+        dq_accum = torch.empty_like(q, dtype=torch.float32)
+        delta = torch.empty_like(lse)
+        # delta = torch.zeros_like(lse)
+
+        BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
+        grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads)
+        _bwd_preprocess_do_o_dot[grid](
+            o,
+            do,
+            delta,
+            o.stride(0),
+            o.stride(2),
+            o.stride(1),
+            do.stride(0),
+            do.stride(2),
+            do.stride(1),
+            nheads,
+            seqlen_q,
+            seqlen_q_rounded,
+            d,
+            BLOCK_M=128,
+            BLOCK_HEADDIM=BLOCK_HEADDIM,
         )
-        
-        # Load K(j) and V(j) from global memory
-        k_j = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        v_j = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        
-        # Initialize dK(j) = dV(j) = 0
-        dk_j = tl.zeros((K_TILE_SIZE, D), dtype=tl.float32)
-        dv_j = tl.zeros((K_TILE_SIZE, D), dtype=tl.float32)
-        
-        # Inner loop over Q tiles (i = 1, ..., Tq)
-        num_q_tiles = tl.cdiv(N_QUERIES, Q_TILE_SIZE)
-        
-        for q_tile_id in range(num_q_tiles):
-            q_start = q_tile_id * Q_TILE_SIZE
-            q_end = tl.minimum(q_start + Q_TILE_SIZE, N_QUERIES)
-            
-            # Early termination for causal attention
-            if is_causal and k_start >= q_end:
-                continue
-                
-            # Load Qi, Oi, dOi from global memory
-            Q_block_ptr = tl.make_block_ptr(
-                Q_ptr + batch_id * stride_qb,
-                shape=(N_QUERIES, D),
-                strides=(stride_qq, stride_qd),
-                offsets=(q_start, 0),
-                block_shape=(Q_TILE_SIZE, D),
-                order=(1, 0),
-            )
-            
-            O_block_ptr = tl.make_block_ptr(
-                O_ptr + batch_id * stride_ob,
-                shape=(N_QUERIES, D),
-                strides=(stride_oq, stride_od),
-                offsets=(q_start, 0),
-                block_shape=(Q_TILE_SIZE, D),
-                order=(1, 0),
-            )
-            
-            dO_block_ptr = tl.make_block_ptr(
-                dO_ptr + batch_id * stride_dob,
-                shape=(N_QUERIES, D),
-                strides=(stride_doq, stride_dod),
-                offsets=(q_start, 0),
-                block_shape=(Q_TILE_SIZE, D),
-                order=(1, 0),
-            )
-            
-            L_block_ptr = tl.make_block_ptr(
-                L_ptr + batch_id * stride_lb,
-                shape=(N_QUERIES,),
-                strides=(stride_lq,),
-                offsets=(q_start,),
-                block_shape=(Q_TILE_SIZE,),
-                order=(0,),
-            )
-            
-            D_block_ptr = tl.make_block_ptr(
-                D_ptr + batch_id * stride_db,
-                shape=(N_QUERIES,),
-                strides=(stride_dq_idx,),
-                offsets=(q_start,),
-                block_shape=(Q_TILE_SIZE,),
-                order=(0,),
-            )
-            
-            # Load all required tensors
-            q_i = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
-            o_i = tl.load(O_block_ptr, boundary_check=(0, 1), padding_option="zero")
-            do_i = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero")
-            L_i = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")
-            D_i = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")
-            
-            # Compute tile of attention scores: S_i^(j) = Q_i (K^(j))^T / sqrt(d)
-            s_ij = tl.dot(q_i, tl.trans(k_j)) * scale
-            
-            # Apply causal mask if needed
-            if is_causal:
-                q_indices = q_start + tl.arange(0, Q_TILE_SIZE)
-                k_indices = k_start + tl.arange(0, K_TILE_SIZE)
-                causal_mask = q_indices[:, None] < k_indices[None, :]
-                s_ij = tl.where(causal_mask, -1e6, s_ij)
-            
-            # Compute attention probabilities: P_i^(j) = exp(S_i^(j) - L_i)
-            p_ij = tl.exp(s_ij - L_i[:, None])
-            
-            # Compute dV^(j) += (P_i^(j))^T dO_i
-            dv_j += tl.dot(tl.trans(p_ij.to(do_i.dtype)), do_i)
-            
-            # Compute dP_i^(j) = dO_i V_j^T  
-            dp_ij = tl.dot(do_i, tl.trans(v_j))
-            
-            # Compute dS_i^(j) = P_i^(j) ◦ (dP_i^(j) - D_i) / sqrt(d)
-            ds_ij = p_ij * (dp_ij.to(p_ij.dtype) - D_i[:, None]) * scale
-            
-            # Apply causal mask to gradients
-            if is_causal:
-                ds_ij = tl.where(causal_mask, 0.0, ds_ij)
-            
-            # Load dQ_i from global memory, update dQ_i += dS_i^(j) K^(j), write back
-            # This must be atomic for correctness!
-            dQ_block_ptr = tl.make_block_ptr(
-                dQ_ptr + batch_id * stride_dqb,
-                shape=(N_QUERIES, D),
-                strides=(stride_dqq, stride_dqd),
-                offsets=(q_start, 0),
-                block_shape=(Q_TILE_SIZE, D),
-                order=(1, 0),
-            )
-            
-            # Load existing dQ_i
-            dq_i = tl.load(dQ_block_ptr, boundary_check=(0, 1), padding_option="zero")
-            
-            # Update: dQ_i += dS_i^(j) K^(j)
-            dq_i += tl.dot(ds_ij.to(k_j.dtype), k_j)
-            
-            # Write back to global memory (atomic)
-            tl.store(dQ_block_ptr, dq_i.to(dQ_block_ptr.type.element_ty), boundary_check=(0, 1))
-            
-            # Compute dK^(j) += (dS_i^(j))^T Q_i
-            dk_j += tl.dot(tl.trans(ds_ij.to(q_i.dtype)), q_i)
-        
-        # Write dK^(j) and dV^(j) to global memory as the j-th tiles of dK and dV
-        dK_block_ptr = tl.make_block_ptr(
-            dK_ptr + batch_id * stride_dkb,
-            shape=(N_KEYS, D),
-            strides=(stride_dkk, stride_dkd),
-            offsets=(k_start, 0),
-            block_shape=(K_TILE_SIZE, D),
-            order=(1, 0),
+
+        has_bias = bias is not None
+        bias_type = "none"
+        if has_bias:
+            assert bias.dtype in [q.dtype, torch.float]
+            assert bias.is_cuda
+            assert bias.dim() == 4
+            assert bias.stride(-1) == 1
+            if bias.shape[2:] == (1, seqlen_k):
+                bias_type = "vector"
+            elif bias.shape[2:] == (seqlen_q, seqlen_k):
+                bias_type = "matrix"
+            else:
+                raise RuntimeError(
+                    "Last 2 dimensions of bias must be (1, seqlen_k)" " or (seqlen_q, seqlen_k)"
+                )
+            bias = bias.expand(batch, nheads, seqlen_q, seqlen_k)
+        bias_strides = (bias.stride(0), bias.stride(1), bias.stride(2)) if has_bias else (0, 0, 0)
+
+        # BLOCK_M = 128
+        # BLOCK_N = 64
+        # num_warps = 4
+        grid = lambda META: (
+            triton.cdiv(seqlen_k, META["BLOCK_N"]) if META["SEQUENCE_PARALLEL"] else 1,
+            batch * nheads,
         )
-        
-        dV_block_ptr = tl.make_block_ptr(
-            dV_ptr + batch_id * stride_dvb,
-            shape=(N_KEYS, D),
-            strides=(stride_dvk, stride_dvd),
-            offsets=(k_start, 0),
-            block_shape=(K_TILE_SIZE, D),
-            order=(1, 0),
+        _bwd_kernel[grid](
+            q,
+            k,
+            v,
+            bias,
+            do,
+            dq_accum,
+            dk,
+            dv,
+            lse,
+            delta,
+            softmax_scale,
+            q.stride(0),
+            q.stride(2),
+            q.stride(1),
+            k.stride(0),
+            k.stride(2),
+            k.stride(1),
+            v.stride(0),
+            v.stride(2),
+            v.stride(1),
+            *bias_strides,
+            do.stride(0),
+            do.stride(2),
+            do.stride(1),
+            dq_accum.stride(0),
+            dq_accum.stride(2),
+            dq_accum.stride(1),
+            dk.stride(0),
+            dk.stride(2),
+            dk.stride(1),
+            dv.stride(0),
+            dv.stride(2),
+            dv.stride(1),
+            nheads,
+            seqlen_q,
+            seqlen_k,
+            seqlen_q_rounded,
+            d,
+            seqlen_q // 32,
+            seqlen_k // 32,  # key for triton cache (limit number of compilations)
+            # Can't use kwargs here because triton autotune expects key to be args, not kwargs
+            # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
+            bias_type,
+            causal,
+            BLOCK_HEADDIM,
+            # SEQUENCE_PARALLEL=False,
+            # BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+            # num_warps=num_warps,
+            # num_stages=1,
         )
-        
-        tl.store(dK_block_ptr, dk_j.to(dK_block_ptr.type.element_ty), boundary_check=(0, 1))
-        tl.store(dV_block_ptr, dv_j.to(dV_block_ptr.type.element_ty), boundary_check=(0, 1))
+        dq.copy_(dq_accum)
     
     class FlashAttentionTritonAll(torch.autograd.Function):
         """
@@ -723,6 +1175,9 @@ if TRITON_AVAILABLE:
             batch_size, seq_len, head_dim = Q.shape
             device = Q.device
             dtype = Q.dtype
+            
+            # 重要：假设单头，如果是多头需要调整
+            nheads = 1
             
             # Ensure contiguous tensors
             Q = Q.contiguous()
@@ -743,19 +1198,21 @@ if TRITON_AVAILABLE:
             
             # Initialize outputs
             O = torch.empty_like(Q)
-            L = torch.empty(batch_size, seq_len, device=device, dtype=torch.float32)
+            
+            # 临时L用于forward kernel（保持原始形状）
+            L_temp = torch.empty(batch_size, seq_len, device=device, dtype=torch.float32)
             
             # Launch kernel
             num_q_tiles = triton.cdiv(seq_len, Q_TILE_SIZE)
             grid = (num_q_tiles, batch_size)
             
             flash_fwd_kernel[grid](
-                Q, K, V, O, L,
+                Q, K, V, O, L_temp,
                 Q.stride(0), Q.stride(1), Q.stride(2),
                 K.stride(0), K.stride(1), K.stride(2),
                 V.stride(0), V.stride(1), V.stride(2),
                 O.stride(0), O.stride(1), O.stride(2),
-                L.stride(0), L.stride(1),
+                L_temp.stride(0), L_temp.stride(1),
                 seq_len, seq_len, scale,
                 D=head_dim,
                 Q_TILE_SIZE=Q_TILE_SIZE,
@@ -765,86 +1222,73 @@ if TRITON_AVAILABLE:
                 num_stages=2,
             )
             
-            ctx.save_for_backward(Q, K, V, O, L)
+            # 关键修复：L需要与Dao-AILab格式匹配 (batch, nheads, seqlen_q_rounded)
+            seqlen_q_rounded = math.ceil(seq_len / 128) * 128
+            L = torch.empty(batch_size, nheads, seqlen_q_rounded, device=device, dtype=torch.float32)
+            
+            # 复制L_temp到正确的L形状，注意stride布局
+            L[:, 0, :seq_len] = L_temp
+            if seq_len < seqlen_q_rounded:
+                L[:, 0, seq_len:] = float('-inf')  # 填充无效位置
+            
+            # 重新整理tensors以匹配Dao-AILab的形状期望 (batch, seqlen, nheads, head_dim)
+            Q_reshaped = Q.unsqueeze(2)  # (batch, seq_len, 1, head_dim)
+            K_reshaped = K.unsqueeze(2)  # (batch, seq_len, 1, head_dim) 
+            V_reshaped = V.unsqueeze(2)  # (batch, seq_len, 1, head_dim)
+            O_reshaped = O.unsqueeze(2)  # (batch, seq_len, 1, head_dim)
+            
+            # 保存6个tensors以匹配backward期望：q, k, v, o, lse, bias
+            ctx.save_for_backward(Q_reshaped, K_reshaped, V_reshaped, O_reshaped, L, None)  # bias=None
             ctx.is_causal = is_causal
             ctx.scale = scale
-            ctx.Q_TILE_SIZE = Q_TILE_SIZE  # Save tile sizes to context
-            ctx.K_TILE_SIZE = K_TILE_SIZE
+            ctx.nheads = nheads
+            ctx.seqlen_q_rounded = seqlen_q_rounded
             
             return O
         
         @staticmethod
-        def backward(ctx, grad_output):
-            """
-            Algorithm 2: Tiled FlashAttention-2 backward pass using Triton kernel.
-            
-            This implementation follows the exact algorithm structure:
-            1. Compute D = rowsum(dO ◦ O) 
-            2. Outer loop over K/V tiles (j)
-            3. Inner loop over Q tiles (i) for each K/V tile
-            4. Atomic updates for dQ accumulation
-            """
-            Q, K, V, O, L = ctx.saved_tensors
+        def backward(ctx, do):
+            q, k, v, o, lse, bias = ctx.saved_tensors
             is_causal = ctx.is_causal
             scale = ctx.scale
-            Q_TILE_SIZE = ctx.Q_TILE_SIZE
-            K_TILE_SIZE = ctx.K_TILE_SIZE
+            nheads = ctx.nheads
+            seqlen_q_rounded = ctx.seqlen_q_rounded
             
-            batch_size, seq_len, head_dim = Q.shape
-            device = Q.device
+            # 确保do是contiguous的
+            if do.stride(-1) != 1:
+                do = do.contiguous()
             
-            # Ensure contiguous gradients
-            grad_output = grad_output.contiguous()
+            # 重新整理do的形状以匹配保存的tensors (batch, seqlen, nheads, head_dim)
+            do_reshaped = do.unsqueeze(2)  # (batch, seq_len, 1, head_dim)
             
-            # Algorithm 2, Step 1: Compute D = rowsum(dO ◦ O)
-            D = torch.sum(grad_output * O, dim=-1)  # (batch, seq_len)
+            # Triton's autotune causes the Tensor._version to change, and so Pytorch autograd
+            # does a memcpy. To avoid this we run in inference_mode, which doesn't track the version.
+            with torch.inference_mode():
+                dq = torch.empty_like(q)
+                dk = torch.empty_like(k)
+                dv = torch.empty_like(v)
+                
+                _flash_attn_backward(
+                    do_reshaped,
+                    q,
+                    k,
+                    v,
+                    o,
+                    lse,
+                    dq,
+                    dk,
+                    dv,
+                    bias=bias,
+                    causal=is_causal,
+                    softmax_scale=scale,
+                )
             
-            # Initialize gradient tensors (Algorithm 2 initialization)
-            dQ = torch.zeros_like(Q)
-            dK = torch.zeros_like(K)
-            dV = torch.zeros_like(V)
+            # 移除添加的head维度以匹配原始输入形状 (batch, seq_len, head_dim)
+            dq_squeezed = dq.squeeze(2)  # (batch, seq_len, head_dim)
+            dk_squeezed = dk.squeeze(2)  # (batch, seq_len, head_dim)
+            dv_squeezed = dv.squeeze(2)  # (batch, seq_len, head_dim)
             
-            # Algorithm 2: Outer loop over K/V tiles (j = 1, ..., Tk)
-            num_k_tiles = triton.cdiv(seq_len, K_TILE_SIZE)
-            grid = (num_k_tiles, batch_size)
-            
-            # Launch the Algorithm 2 backward kernel
-            flash_bwd_kernel_v2[grid](
-                Q, K, V, O, grad_output, L, D,
-                dQ, dK, dV,
-                # Q strides
-                Q.stride(0), Q.stride(1), Q.stride(2),
-                # K strides  
-                K.stride(0), K.stride(1), K.stride(2),
-                # V strides
-                V.stride(0), V.stride(1), V.stride(2),
-                # O strides
-                O.stride(0), O.stride(1), O.stride(2),
-                # dO strides
-                grad_output.stride(0), grad_output.stride(1), grad_output.stride(2),
-                # L strides
-                L.stride(0), L.stride(1),
-                # D strides
-                D.stride(0), D.stride(1),
-                # dQ strides
-                dQ.stride(0), dQ.stride(1), dQ.stride(2),
-                # dK strides
-                dK.stride(0), dK.stride(1), dK.stride(2),
-                # dV strides
-                dV.stride(0), dV.stride(1), dV.stride(2),
-                # Problem size
-                seq_len, seq_len, scale,
-                # Compile-time constants
-                D=head_dim,
-                Q_TILE_SIZE=Q_TILE_SIZE,
-                K_TILE_SIZE=K_TILE_SIZE,
-                is_causal=is_causal,
-                # Triton launch parameters
-                num_warps=4,
-                num_stages=2,
-            )
-            
-            return dQ, dK, dV, None
+            return dq_squeezed, dk_squeezed, dv_squeezed, None
 else:
     class FlashAttentionTritonFunction(torch.autograd.Function):
         @staticmethod
