@@ -505,3 +505,159 @@ run_flashattention2_benchmark = run_flashattention_optimized_benchmark
 if __name__ == "__main__":
     # Run the optimized benchmark
     df, benchmarker = run_flashattention_optimized_benchmark()
+
+def run_official_leaderboard_benchmark():
+    """
+    Run the official CS336 Assignment 2 leaderboard benchmark for FlashAttention-2.
+    
+    This implements the exact test specification:
+    - Batch size: 1  
+    - Sequence length: 16,384
+    - Number of heads: 16
+    - Head dimension: 64 (dmodel=1024/16)
+    - Data type: BF16
+    - Causal masking: True
+    - Timing: Forward + Backward pass
+    """
+    print("\n" + "=" * 100)
+    print("🏆 OFFICIAL CS336 LEADERBOARD BENCHMARK - FlashAttention-2")
+    print("=" * 100)
+    
+    if not torch.cuda.is_available():
+        print("❌ CUDA is not available. This benchmark requires a CUDA GPU.")
+        return None
+    
+    # Official leaderboard configuration
+    n_heads = 16
+    d_head = 64  # dmodel=1024, so d_head = 1024/16 = 64
+    sequence_length = 16384
+    batch_size = 1
+    dtype = torch.bfloat16
+    is_causal = True
+    
+    print(f"📋 Official Test Configuration:")
+    print(f"  - Batch size: {batch_size}")
+    print(f"  - Number of heads: {n_heads}")
+    print(f"  - Head dimension: {d_head}")
+    print(f"  - Sequence length: {sequence_length:,}")
+    print(f"  - Model dimension: {n_heads * d_head}")
+    print(f"  - Data type: {dtype}")
+    print(f"  - Causal masking: {is_causal}")
+    print(f"  - Device: {torch.cuda.get_device_name()}")
+    
+    # Create test tensors with official specification
+    # Note: Official test uses shape (n_heads, seq_len, d_head)
+    shape = (n_heads, sequence_length, d_head)
+    
+    print(f"\n🎯 Creating test tensors:")
+    print(f"  - Shape: {shape}")
+    print(f"  - Memory per tensor: {torch.numel(torch.zeros(shape)) * 2 / 1e6:.1f} MB (BF16)")
+    
+    q = torch.randn(shape, device='cuda', dtype=dtype, requires_grad=True)
+    k = torch.randn(shape, device='cuda', dtype=dtype, requires_grad=True)
+    v = torch.randn(shape, device='cuda', dtype=dtype, requires_grad=True)
+    
+    # Import the FlashAttention-2 implementation
+    try:
+        from flash_attention2 import FlashAttentionTritonFunction
+        
+        # Create the leaderboard class wrapper
+        class FlashAttention2:
+            @staticmethod
+            def apply(q, k, v, is_causal=True):
+                return FlashAttentionTritonFunction.apply(q, k, v, is_causal)
+        
+        print(f"✅ FlashAttention-2 implementation loaded successfully")
+        
+    except ImportError as e:
+        print(f"❌ Failed to import FlashAttention-2: {e}")
+        return None
+    
+    # Compile the function as specified in the official test
+    flash = torch.compile(FlashAttention2.apply)
+    
+    def flash_forward_backward():
+        """The exact function that will be benchmarked on the leaderboard."""
+        # Clear any existing gradients
+        if q.grad is not None:
+            q.grad.zero_()
+        if k.grad is not None:
+            k.grad.zero_()
+        if v.grad is not None:
+            v.grad.zero_()
+        
+        # Forward pass
+        o = flash(q, k, v, True)  # is_causal=True
+        
+        # Backward pass
+        loss = o.sum()
+        loss.backward()
+        
+        # Ensure all operations complete
+        torch.cuda.synchronize()
+    
+    print(f"\n⏱️  Running Official Benchmark:")
+    print(f"  - Warmup iterations: 1,000")
+    print(f"  - Benchmark iterations: 10,000")
+    print(f"  - Function: flash_forward_backward() [forward + backward]")
+    
+    try:
+        # Run a quick correctness check first
+        print(f"\n🔍 Quick correctness verification...")
+        test_output = flash(q, k, v, True)
+        test_loss = test_output.sum()
+        test_loss.backward()
+        
+        assert test_output.shape == q.shape, f"Shape mismatch: {test_output.shape} vs {q.shape}"
+        assert q.grad is not None, "Q gradient is None"
+        assert k.grad is not None, "K gradient is None"
+        assert v.grad is not None, "V gradient is None"
+        print(f"✅ Correctness check passed")
+        
+        # Clear gradients before benchmark
+        q.grad.zero_()
+        k.grad.zero_()
+        v.grad.zero_()
+        
+        # Run the official benchmark using triton.testing.do_bench
+        print(f"\n🚀 Starting official benchmark...")
+        
+        results = triton.testing.do_bench(
+            flash_forward_backward,
+            rep=10000,     # 10,000 repetitions as specified
+            warmup=1000    # 1,000 warmup iterations as specified  
+        )
+        
+        print(f"\n🎉 OFFICIAL LEADERBOARD RESULT:")
+        print(f"" + "="*60)
+        print(f"⏰ Average Time: {results:.4f} ms")
+        print(f"🚀 Throughput: {1000/results:.2f} forward+backward/sec")
+        print(f"" + "="*60)
+        
+        # Additional metrics for context
+        total_params = n_heads * sequence_length * d_head
+        flops_per_iteration = 4 * n_heads * sequence_length * sequence_length * d_head  # Rough estimate
+        gflops = (flops_per_iteration * 1000 / results) / 1e9
+        
+        print(f"\n📊 Additional Metrics:")
+        print(f"  - Parameters per iteration: {total_params:,}")
+        print(f"  - Estimated FLOPS per iteration: {flops_per_iteration/1e9:.2f} GFLOPS")
+        print(f"  - Estimated throughput: {gflops:.2f} GFLOPS")
+        print(f"  - Memory bandwidth utilization: High (exact depends on hardware)")
+        
+        print(f"\n💡 Leaderboard Submission:")
+        print(f"  Submit this result: {results:.4f} ms")
+        
+        return results
+        
+    except torch.cuda.OutOfMemoryError:
+        print(f"❌ CUDA Out of Memory Error")
+        print(f"   - This configuration requires significant GPU memory")
+        print(f"   - Estimated memory needed: ~{3 * torch.numel(q) * 2 / 1e9:.1f} GB for tensors alone")
+        print(f"   - Try running on a GPU with more memory (H100 recommended)")
+        return None
+        
+    except Exception as e:
+        print(f"❌ Benchmark failed: {e}")
+        print(f"   Check your FlashAttention-2 implementation for bugs")
+        return None
