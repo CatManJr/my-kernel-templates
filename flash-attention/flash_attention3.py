@@ -1,5 +1,5 @@
 """
-FlashAttention-3 implementation in PyTorch and Triton.
+FlashAttention-3 implementation with Triton for backward & PyTorch for backward.
 
 ✅ SUCCESSFULLY IMPLEMENTED FA-3 FEATURES:
 
