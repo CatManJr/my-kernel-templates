@@ -25,7 +25,7 @@ class OptimizedBenchmarkConfig:
     """Optimized configuration for benchmarking FlashAttention implementations."""
     # Sequence lengths optimized for each FA version
     short_sequences: List[int] = None    # FA-1 optimal range
-    medium_sequences: List[int] = None   # FA-2 optimal range  
+    medium_sequences: List[int] = None   # FA-2 and FA-2-Full optimal range  
     long_sequences: List[int] = None     # FA-3 optimal range
     
     # Head dimensions commonly used
@@ -34,13 +34,14 @@ class OptimizedBenchmarkConfig:
     # Precision per implementation
     fa1_dtypes: List[torch.dtype] = None     # FA-1 works best with float32
     fa2_dtypes: List[torch.dtype] = None     # FA-2 optimized for bfloat16
+    fa2_full_dtypes: List[torch.dtype] = None # FA-2-Full (same as FA-2)
     fa3_dtypes: List[torch.dtype] = None     # FA-3 uses mixed precision
     pytorch_dtypes: List[torch.dtype] = None # PyTorch baseline
     
     batch_size: int = 1
     is_causal: bool = True
     num_warmup: int = 5
-    num_iterations: int = 20
+    num_iterations: int = 10
     device: str = 'cuda'
     
     def __post_init__(self):
@@ -48,7 +49,7 @@ class OptimizedBenchmarkConfig:
         if self.short_sequences is None:
             self.short_sequences = [128, 256, 512]  # FA-1 sweet spot
         if self.medium_sequences is None:
-            self.medium_sequences = [1024, 2048, 4096]  # FA-2 sweet spot
+            self.medium_sequences = [1024, 2048, 4096]  # FA-2 and FA-2-Full sweet spot
         if self.long_sequences is None:
             self.long_sequences = [2048, 4096, 8192]  # FA-3 using same as FA-2 to avoid hanging
             
@@ -60,6 +61,8 @@ class OptimizedBenchmarkConfig:
             self.fa1_dtypes = [torch.float32]  # Only FP32
         if self.fa2_dtypes is None:
             self.fa2_dtypes = [torch.float32]  # Only FP32
+        if self.fa2_full_dtypes is None:
+            self.fa2_full_dtypes = [torch.float32]  # Only FP32 - same as FA-2
         if self.fa3_dtypes is None:
             self.fa3_dtypes = [torch.float32]  # Only FP32
         if self.pytorch_dtypes is None:
@@ -76,8 +79,8 @@ class BenchmarkResult:
     forward_ms: float
     backward_ms: float
     end_to_end_ms: float
-    memory_mb: Optional[float] = None
     speedup_vs_pytorch: Optional[float] = None
+    speedup_vs_pytorch_backward: Optional[float] = None
 
 
 def standard_pytorch_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, 
@@ -155,54 +158,61 @@ class FlashAttentionBenchmarker:
     
     def benchmark_implementation(self, impl_name: str, attention_fn: Callable, 
                                 seq_len: int, head_dim: int, dtype: torch.dtype) -> BenchmarkResult:
-        """Benchmark a single implementation configuration - 只比较前向传播."""
+        """Benchmark a single implementation configuration - FA-2和FA-2 FULL包含反向传播测试."""
         
         # Create appropriate inputs 
         is_4d = 'FA1' in impl_name or 'FlashAttention1' in impl_name
-        Q, K, V, grad_output = self.create_test_inputs(seq_len, head_dim, dtype, is_4d)
+        
+        # 判断是否需要反向传播测试 - 只有FA-2和FA-2 FULL需要
+        needs_backward = ('FlashAttention2' in impl_name or 'FA2' in impl_name)
         
         try:
-            # Clear GPU memory and get baseline BEFORE detaching
+            # Clear GPU memory
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-            memory_before = torch.cuda.memory_allocated() / (1024 * 1024)  # MB
             
-            # 现在detach张量，只测试前向传播
-            Q_test = Q.detach()
-            K_test = K.detach() 
-            V_test = V.detach()
-            
-            # Measure memory after creating test tensors
-            torch.cuda.synchronize()
-            memory_after_inputs = torch.cuda.memory_allocated() / (1024 * 1024)  # MB
-            
-            # Store references to prevent garbage collection during benchmark
-            tensors_ref = [Q_test, K_test, V_test]
-            
-            # Benchmark forward pass only
+            # Benchmark forward pass
             def forward_fn():
-                output = attention_fn(Q_test, K_test, V_test, self.config.is_causal)
-                # Ensure output is computed
+                Q, K, V, grad_output = self.create_test_inputs(seq_len, head_dim, dtype, is_4d)
+                output = attention_fn(Q, K, V, self.config.is_causal)
                 torch.cuda.synchronize()
+                # Clean up to avoid memory issues
+                del Q, K, V, grad_output
                 return output
             
             forward_ms = self.benchmark_with_cuda_events(forward_fn)
             
-            # Measure peak memory after forward pass
-            torch.cuda.synchronize()
-            memory_peak = torch.cuda.memory_allocated() / (1024 * 1024)  # MB
+            # Benchmark backward pass (only for FA-2 variants)
+            backward_ms = 0.0
+            if needs_backward:
+                def backward_fn():
+                    Q, K, V, grad_output = self.create_test_inputs(seq_len, head_dim, dtype, is_4d)
+                    output = attention_fn(Q, K, V, self.config.is_causal)
+                    loss = output.sum()
+                    loss.backward()
+                    torch.cuda.synchronize()
+                    # Clean up to avoid memory issues
+                    del Q, K, V, grad_output, output, loss
+                
+                backward_ms = self.benchmark_with_cuda_events(backward_fn)
             
-            # Calculate actual memory usage (peak memory during computation)
-            memory_usage_mb = max(memory_peak - memory_before, memory_after_inputs - memory_before)
+            # Calculate end-to-end time
+            end_to_end_ms = forward_ms + backward_ms
             
-            # Clean up references
-            del tensors_ref, Q_test, K_test, V_test
-            
-            # Calculate speedup vs PyTorch baseline (only forward pass)
+            # Calculate speedup vs PyTorch baseline
             pytorch_key = (seq_len, head_dim, str(dtype).split('.')[-1])
             speedup = None
+            speedup_backward = None
             if pytorch_key in self.pytorch_baseline:
-                speedup = self.pytorch_baseline[pytorch_key] / forward_ms
+                baseline_result = self.pytorch_baseline[pytorch_key]
+                if isinstance(baseline_result, tuple):
+                    baseline_forward, baseline_backward = baseline_result
+                    speedup = baseline_forward / forward_ms if forward_ms > 0 else None
+                    if needs_backward and baseline_backward > 0 and backward_ms > 0:
+                        speedup_backward = baseline_backward / backward_ms
+                else:
+                    # 兼容旧版本，假设是end_to_end时间
+                    speedup = baseline_result / end_to_end_ms if end_to_end_ms > 0 else None
             
             return BenchmarkResult(
                 seq_len=seq_len,
@@ -210,10 +220,10 @@ class FlashAttentionBenchmarker:
                 dtype=str(dtype).split('.')[-1],
                 implementation=impl_name,
                 forward_ms=forward_ms,
-                backward_ms=0.0,  # 不测试backward
-                end_to_end_ms=forward_ms,  # 只有前向传播
-                memory_mb=memory_usage_mb,
-                speedup_vs_pytorch=speedup
+                backward_ms=backward_ms,
+                end_to_end_ms=end_to_end_ms,
+                speedup_vs_pytorch=speedup,
+                speedup_vs_pytorch_backward=speedup_backward
             )
             
         except Exception as e:
@@ -224,14 +234,13 @@ class FlashAttentionBenchmarker:
                 dtype=str(dtype).split('.')[-1],
                 implementation=impl_name,
                 forward_ms=float('inf'),
-                backward_ms=0.0,
+                backward_ms=float('inf'),
                 end_to_end_ms=float('inf'),
-                memory_mb=0.0,
-                speedup_vs_pytorch=0.0
+                speedup_vs_pytorch=0.0,
+                speedup_vs_pytorch_backward=0.0
             )
         finally:
-            # Clean up original tensors
-            del Q, K, V, grad_output
+            # Clean up any remaining memory
             torch.cuda.empty_cache()
     
     def run_optimized_benchmark(self) -> pd.DataFrame:
@@ -268,15 +277,59 @@ class FlashAttentionBenchmarker:
                 for dtype in self.config.pytorch_dtypes:
                     print(f"  PyTorch: seq_len={seq_len}, head_dim={head_dim}, dtype={dtype}")
                     
-                    result = self.benchmark_implementation(
-                        "PyTorch_Standard", standard_pytorch_attention, 
-                        seq_len, head_dim, dtype
-                    )
-                    all_results.append(result)
+                    # 为PyTorch创建特殊的benchmark方法，包含反向传播
+                    def pytorch_forward_backward():
+                        Q, K, V, grad_output = self.create_test_inputs(seq_len, head_dim, dtype, False)
+                        output = standard_pytorch_attention(Q, K, V, self.config.is_causal)
+                        loss = output.sum()
+                        loss.backward()
+                        torch.cuda.synchronize()
+                        # Clean up
+                        del Q, K, V, grad_output, output, loss
                     
-                    # Store baseline for speedup calculation
-                    key = (seq_len, head_dim, str(dtype).split('.')[-1])
-                    self.pytorch_baseline[key] = result.end_to_end_ms
+                    # 分别测试前向和反向传播
+                    def pytorch_forward_only():
+                        Q, K, V, grad_output = self.create_test_inputs(seq_len, head_dim, dtype, False)
+                        output = standard_pytorch_attention(Q, K, V, self.config.is_causal)
+                        torch.cuda.synchronize()
+                        del Q, K, V, grad_output, output
+                    
+                    try:
+                        forward_ms = self.benchmark_with_cuda_events(pytorch_forward_only)
+                        backward_ms = self.benchmark_with_cuda_events(pytorch_forward_backward) - forward_ms
+                        
+                        result = BenchmarkResult(
+                            seq_len=seq_len,
+                            head_dim=head_dim,
+                            dtype=str(dtype).split('.')[-1],
+                            implementation="PyTorch_Standard",
+                            forward_ms=forward_ms,
+                            backward_ms=backward_ms,
+                            end_to_end_ms=forward_ms + backward_ms,
+                            speedup_vs_pytorch=1.0,
+                            speedup_vs_pytorch_backward=1.0
+                        )
+                        all_results.append(result)
+                        
+                        # Store baseline for speedup calculation (forward_ms, backward_ms)
+                        key = (seq_len, head_dim, str(dtype).split('.')[-1])
+                        self.pytorch_baseline[key] = (result.forward_ms, result.backward_ms)
+                        
+                    except Exception as e:
+                        print(f"    FAILED PyTorch_Standard: {str(e)}")
+                        # 创建失败的结果
+                        result = BenchmarkResult(
+                            seq_len=seq_len,
+                            head_dim=head_dim,
+                            dtype=str(dtype).split('.')[-1],
+                            implementation="PyTorch_Standard",
+                            forward_ms=float('inf'),
+                            backward_ms=float('inf'),
+                            end_to_end_ms=float('inf'),
+                            speedup_vs_pytorch=0.0,
+                            speedup_vs_pytorch_backward=0.0
+                        )
+                        all_results.append(result)
         
         # 2. Test FA-1 on short sequences (its strength)
         print("\n⚡ Testing FlashAttention-1 (Short Sequences)...")
@@ -304,7 +357,29 @@ class FlashAttentionBenchmarker:
                     )
                     all_results.append(result)
         
-        # 4. Test FA-3 on long sequences (its strength)
+        # 4. Test FA-2-FULL on medium sequences (same as FA-2 for fair comparison)
+        try:
+            from flash_attention2 import flash_attention_all_triton
+            print("\n🔥🔥 Testing FlashAttention-2-FULL (Medium Sequences - Complete Triton Implementation)...")
+            for seq_len in self.config.medium_sequences:
+                for head_dim in self.config.head_dims:
+                    for dtype in self.config.fa2_full_dtypes:
+                        print(f"  FA-2-FULL: seq_len={seq_len}, head_dim={head_dim}, dtype={dtype}")
+                        
+                        result = self.benchmark_implementation(
+                            "FlashAttention2_FULL", flash_attention_all_triton,
+                            seq_len, head_dim, dtype
+                        )
+                        all_results.append(result)
+            fa2_full_available = True
+        except ImportError as e:
+            print(f"  ⚠️  FA-2-FULL not available: {e}")
+            fa2_full_available = False
+        except Exception as e:
+            print(f"  ❌ FA-2-FULL failed: {e}")
+            fa2_full_available = False
+            
+        # 5. Test FA-3 on long sequences (its strength)
         print("\n🌟 Testing FlashAttention-3 (Long Sequences)...")
         for seq_len in self.config.long_sequences:
             for head_dim in self.config.head_dims:
@@ -317,7 +392,7 @@ class FlashAttentionBenchmarker:
                     )
                     all_results.append(result)
         
-        # 5. Cross-comparison: test all FA versions on all sequence lengths
+        # 6. Cross-comparison: test all FA versions on all sequence lengths
         print("\n🔄 Cross-Comparison (All FA versions on all sequences)...")
         all_sequences = self.config.short_sequences + self.config.medium_sequences + self.config.long_sequences
         
@@ -326,6 +401,10 @@ class FlashAttentionBenchmarker:
             ("FA2_CrossTest", flash_attention_triton, self.config.fa2_dtypes),
             ("FA3_CrossTest", flash_attention_v3, self.config.fa3_dtypes),
         ]
+        
+        # Add FA-2-FULL to cross-comparison if available
+        if fa2_full_available:
+            implementations.append(("FA2_FULL_CrossTest", flash_attention_all_triton, self.config.fa2_full_dtypes))
         
         for seq_len in all_sequences:
             for head_dim in [64]:  # Focus on common head_dim for cross-comparison
@@ -349,8 +428,8 @@ class FlashAttentionBenchmarker:
                 'forward_ms': r.forward_ms,
                 'backward_ms': r.backward_ms,
                 'end_to_end_ms': r.end_to_end_ms,
-                'memory_mb': r.memory_mb if r.memory_mb is not None else 0.0,  # Add default value
                 'speedup_vs_pytorch': r.speedup_vs_pytorch,
+                'speedup_vs_pytorch_backward': r.speedup_vs_pytorch_backward,
             }
             for r in all_results
         ])
@@ -370,7 +449,7 @@ class FlashAttentionBenchmarker:
         ranges = [
             ("Short (128-512)", self.config.short_sequences),
             ("Medium (1K-4K)", self.config.medium_sequences), 
-            ("Long (8K-16K)", self.config.long_sequences)
+            ("Long (2K-4K)", self.config.long_sequences)
         ]
         
         for range_name, seq_lens in ranges:
@@ -381,48 +460,126 @@ class FlashAttentionBenchmarker:
                 best_per_config = range_df.loc[range_df.groupby(['seq_len', 'head_dim', 'dtype'])['end_to_end_ms'].idxmin()]
                 
                 for _, row in best_per_config.iterrows():
-                    speedup_str = f"{row['speedup_vs_pytorch']:.2f}x" if row['speedup_vs_pytorch'] else "N/A"
+                    speedup_str = f"{row['speedup_vs_pytorch']:.2f}x" if row['speedup_vs_pytorch'] and row['speedup_vs_pytorch'] > 0 else "N/A"
                     print(f"  seq_len={row['seq_len']}, head_dim={row['head_dim']}, dtype={row['dtype']}: "
                           f"{row['implementation']} ({row['end_to_end_ms']:.2f}ms, {speedup_str})")
         
-        # 2. Speedup comparison
-        print(f"\n🚀 SPEEDUP vs PyTorch (End-to-End):")
+        # 2. Forward Pass Speedup comparison
+        print(f"\n🚀 FORWARD PASS SPEEDUP vs PyTorch:")
         print("-" * 80)
         
-        fa_implementations = ['FlashAttention1_Triton', 'FlashAttention2_Triton', 'FlashAttention3_Triton']
+        fa_implementations = [
+            'FlashAttention1_Triton', 
+            'FlashAttention2_Triton',
+            'FlashAttention2_FULL', 
+            'FlashAttention3_Triton',
+            'FA1_CrossTest',
+            'FA2_CrossTest',
+            'FA2_FULL_CrossTest',
+            'FA3_CrossTest'
+        ]
         
         for impl in fa_implementations:
             impl_df = df[df['implementation'] == impl]
             if not impl_df.empty and impl_df['speedup_vs_pytorch'].notna().any():
-                avg_speedup = impl_df['speedup_vs_pytorch'].mean()
-                max_speedup = impl_df['speedup_vs_pytorch'].max()
-                print(f"  {impl}: Average {avg_speedup:.2f}x, Max {max_speedup:.2f}x")
+                valid_speedups = impl_df[impl_df['speedup_vs_pytorch'].notna() & (impl_df['speedup_vs_pytorch'] > 0)]
+                if not valid_speedups.empty:
+                    avg_speedup = valid_speedups['speedup_vs_pytorch'].mean()
+                    max_speedup = valid_speedups['speedup_vs_pytorch'].max()
+                    best_config = valid_speedups.loc[valid_speedups['speedup_vs_pytorch'].idxmax()]
+                    print(f"  {impl}: Average {avg_speedup:.2f}x, Max {max_speedup:.2f}x "
+                          f"(seq_len={best_config['seq_len']}, head_dim={best_config['head_dim']})")
         
-        # 3. Detailed comparison table
-        print(f"\n📊 DETAILED RESULTS (End-to-End Time in ms):")
+        # 3. NEW: Backward Pass Speedup comparison
+        print(f"\n⚡ BACKWARD PASS SPEEDUP vs PyTorch:")
+        print("-" * 80)
+        
+        for impl in fa_implementations:
+            impl_df = df[df['implementation'] == impl]
+            if not impl_df.empty and impl_df['speedup_vs_pytorch_backward'].notna().any():
+                valid_speedups = impl_df[impl_df['speedup_vs_pytorch_backward'].notna() & (impl_df['speedup_vs_pytorch_backward'] > 0)]
+                if not valid_speedups.empty:
+                    avg_speedup = valid_speedups['speedup_vs_pytorch_backward'].mean()
+                    max_speedup = valid_speedups['speedup_vs_pytorch_backward'].max()
+                    best_config = valid_speedups.loc[valid_speedups['speedup_vs_pytorch_backward'].idxmax()]
+                    print(f"  {impl}: Average {avg_speedup:.2f}x, Max {max_speedup:.2f}x "
+                          f"(seq_len={best_config['seq_len']}, head_dim={best_config['head_dim']})")
+
+        # 4. FA-2 vs FA-2-Full direct comparison (Forward + Backward)
+        print(f"\n⚔️  FA-2 vs FA-2-FULL DIRECT COMPARISON:")
+        print("-" * 80)
+        
+        fa2_df = df[df['implementation'] == 'FlashAttention2_Triton']
+        fa2_full_df = df[df['implementation'] == 'FlashAttention2_FULL']
+        
+        if not fa2_df.empty and not fa2_full_df.empty:
+            # Find common configurations
+            fa2_configs = set(zip(fa2_df['seq_len'], fa2_df['head_dim'], fa2_df['dtype']))
+            fa2_full_configs = set(zip(fa2_full_df['seq_len'], fa2_full_df['head_dim'], fa2_full_df['dtype']))
+            common_configs = fa2_configs.intersection(fa2_full_configs)
+            
+            print(f"Comparing {len(common_configs)} common configurations:")
+            print("\nForward Pass Comparison:")
+            
+            for seq_len, head_dim, dtype in sorted(common_configs):
+                fa2_row = fa2_df[(fa2_df['seq_len'] == seq_len) & 
+                                (fa2_df['head_dim'] == head_dim) & 
+                                (fa2_df['dtype'] == dtype)].iloc[0]
+                
+                fa2_full_row = fa2_full_df[(fa2_full_df['seq_len'] == seq_len) & 
+                                          (fa2_full_df['head_dim'] == head_dim) & 
+                                          (fa2_full_df['dtype'] == dtype)].iloc[0]
+                
+                # Forward pass comparison
+                if fa2_full_row['forward_ms'] > 0 and fa2_row['forward_ms'] > 0:
+                    forward_speedup = fa2_row['forward_ms'] / fa2_full_row['forward_ms']
+                    forward_winner = "FA-2-FULL" if forward_speedup > 1.0 else "FA-2"
+                    print(f"  seq_len={seq_len}, head_dim={head_dim}: "
+                          f"FA-2={fa2_row['forward_ms']:.2f}ms vs FA-2-FULL={fa2_full_row['forward_ms']:.2f}ms "
+                          f"(Winner: {forward_winner}, {abs(forward_speedup):.2f}x)")
+                
+            print("\nBackward Pass Comparison:")
+            for seq_len, head_dim, dtype in sorted(common_configs):
+                fa2_row = fa2_df[(fa2_df['seq_len'] == seq_len) & 
+                                (fa2_df['head_dim'] == head_dim) & 
+                                (fa2_df['dtype'] == dtype)].iloc[0]
+                
+                fa2_full_row = fa2_full_df[(fa2_full_df['seq_len'] == seq_len) & 
+                                          (fa2_full_df['head_dim'] == head_dim) & 
+                                          (fa2_full_df['dtype'] == dtype)].iloc[0]
+                
+                # Backward pass comparison
+                if fa2_full_row['backward_ms'] > 0 and fa2_row['backward_ms'] > 0:
+                    backward_speedup = fa2_row['backward_ms'] / fa2_full_row['backward_ms']
+                    backward_winner = "FA-2-FULL" if backward_speedup > 1.0 else "FA-2"
+                    print(f"  seq_len={seq_len}, head_dim={head_dim}: "
+                          f"FA-2={fa2_row['backward_ms']:.2f}ms vs FA-2-FULL={fa2_full_row['backward_ms']:.2f}ms "
+                          f"(Winner: {backward_winner}, {abs(backward_speedup):.2f}x)")
+        else:
+            print("  No data available for comparison")
+
+        # 5. Detailed timing breakdown table
+        print(f"\n📊 DETAILED TIMING BREAKDOWN:")
         print("-" * 120)
         
-        # Create pivot table
-        pivot_df = df.pivot_table(
-            values='end_to_end_ms',
-            index=['seq_len', 'head_dim', 'dtype'],
-            columns='implementation',
-            fill_value=float('inf')
-        )
+        # Create separate tables for forward, backward, and end-to-end
+        for timing_type, column in [("Forward", "forward_ms"), ("Backward", "backward_ms"), ("End-to-End", "end_to_end_ms")]:
+            print(f"\n{timing_type} Pass Time (ms):")
+            pivot_df = df.pivot_table(
+                values=column,
+                index=['seq_len', 'head_dim', 'dtype'],
+                columns='implementation',
+                fill_value=float('inf')
+            )
+            
+            # Format and display
+            for col in pivot_df.columns:
+                pivot_df[col] = pivot_df[col].apply(lambda x: f"{x:.2f}" if x != float('inf') else "FAIL")
+            
+            print(pivot_df.to_string())
+            print()
         
-        # Format and display
-        for col in pivot_df.columns:
-            pivot_df[col] = pivot_df[col].apply(lambda x: f"{x:.2f}" if x != float('inf') else "FAIL")
-        
-        print(pivot_df.to_string())
-        
-        # 4. Memory efficiency (if available)
-        if df['memory_mb'].notna().any():
-            print(f"\n💾 MEMORY USAGE (MB):")
-            print("-" * 50)
-            memory_df = df[df['memory_mb'].notna()].groupby('implementation')['memory_mb'].mean()
-            for impl, mem in memory_df.items():
-                print(f"  {impl}: {mem:.1f} MB")
+        # Remove memory section entirely as requested
     
     def save_results(self, df: pd.DataFrame, filename: str = None):
         """Save benchmark results to CSV."""
