@@ -839,10 +839,32 @@ def flash_attention_pytorch(Q, K, V, is_causal=False):
 
 
 def flash_attention_triton(Q, K, V, is_causal=False):
-    """Triton FlashAttention-2."""
+    """Triton FlashAttention-2 with proper dtype handling."""
     if not TRITON_AVAILABLE:
         raise RuntimeError("Triton is not available")
-    return FlashAttentionTritonFunction.apply(Q, K, V, is_causal)
+    
+    # Ensure input tensors are properly converted and contiguous
+    original_dtype = Q.dtype
+    
+    # Convert inputs to compatible dtype if needed
+    if Q.dtype == torch.bfloat16:
+        # Keep bfloat16 for computation efficiency
+        Q = Q.contiguous()
+        K = K.contiguous()
+        V = V.contiguous()
+    else:
+        # For other dtypes, ensure they're contiguous
+        Q = Q.contiguous()
+        K = K.contiguous()
+        V = V.contiguous()
+    
+    result = FlashAttentionTritonFunction.apply(Q, K, V, is_causal)
+    
+    # Ensure output has the same dtype as input
+    if result.dtype != original_dtype:
+        result = result.to(original_dtype)
+    
+    return result
 
 
 def flash_attention_all_triton(Q, K, V, is_causal=False):

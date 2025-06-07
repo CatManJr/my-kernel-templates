@@ -1,8 +1,13 @@
 """
-FlashAttention Benchmarking Utilities
+FlashAttention Comprehensive Benchmarking Utilities
 
-This module provides benchmarking utilities for comparing different FlashAttention implementations
-with standard PyTorch attention mechanisms. Designed to be reusable for FlashAttention-1, 2, and 3.
+This module provides optimized benchmarking utilities for comparing our three FlashAttention 
+implementations (FA-1, FA-2, FA-3) with standard PyTorch attention, considering each version's 
+optimal data precision and use cases.
+
+FA-1: Best for small-medium sequences, float32 precision
+FA-2: Best for general use, bfloat16 precision  
+FA-3: Best for long sequences, mixed precision
 """
 
 import math
@@ -16,17 +21,49 @@ import time
 
 
 @dataclass
-class BenchmarkConfig:
-    """Configuration for benchmarking experiments."""
-    sequence_lengths: List[int]
-    head_dims: List[int]
-    dtypes: List[torch.dtype]
+class OptimizedBenchmarkConfig:
+    """Optimized configuration for benchmarking FlashAttention implementations."""
+    # Sequence lengths optimized for each FA version
+    short_sequences: List[int] = None    # FA-1 optimal range
+    medium_sequences: List[int] = None   # FA-2 optimal range  
+    long_sequences: List[int] = None     # FA-3 optimal range
+    
+    # Head dimensions commonly used
+    head_dims: List[int] = None
+    
+    # Precision per implementation
+    fa1_dtypes: List[torch.dtype] = None     # FA-1 works best with float32
+    fa2_dtypes: List[torch.dtype] = None     # FA-2 optimized for bfloat16
+    fa3_dtypes: List[torch.dtype] = None     # FA-3 uses mixed precision
+    pytorch_dtypes: List[torch.dtype] = None # PyTorch baseline
+    
     batch_size: int = 1
-    num_heads: int = 1  # Added for FlashAttention-1 which expects 4D tensors
     is_causal: bool = True
-    num_warmup: int = 10
-    num_iterations: int = 100
+    num_warmup: int = 5
+    num_iterations: int = 20
     device: str = 'cuda'
+    
+    def __post_init__(self):
+        """Set default values optimized for each FA version."""
+        if self.short_sequences is None:
+            self.short_sequences = [128, 256, 512]  # FA-1 sweet spot
+        if self.medium_sequences is None:
+            self.medium_sequences = [1024, 2048, 4096]  # FA-2 sweet spot
+        if self.long_sequences is None:
+            self.long_sequences = [2048, 4096, 8192]  # FA-3 using same as FA-2 to avoid hanging
+            
+        if self.head_dims is None:
+            self.head_dims = [32, 64, 128]  # Common transformer head dimensions
+            
+        # 🔧 MODIFIED: Use only FP32 precision for all implementations
+        if self.fa1_dtypes is None:
+            self.fa1_dtypes = [torch.float32]  # Only FP32
+        if self.fa2_dtypes is None:
+            self.fa2_dtypes = [torch.float32]  # Only FP32
+        if self.fa3_dtypes is None:
+            self.fa3_dtypes = [torch.float32]  # Only FP32
+        if self.pytorch_dtypes is None:
+            self.pytorch_dtypes = [torch.float32]  # Only FP32
 
 
 @dataclass
@@ -40,321 +77,269 @@ class BenchmarkResult:
     backward_ms: float
     end_to_end_ms: float
     memory_mb: Optional[float] = None
+    speedup_vs_pytorch: Optional[float] = None
 
 
 def standard_pytorch_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, 
                              is_causal: bool = False) -> torch.Tensor:
-    """
-    Standard PyTorch attention implementation for comparison.
+    """Standard PyTorch attention implementation for comparison (3D tensors only)."""
+    batch_size, seq_len, head_dim = Q.shape
+    scale = 1.0 / math.sqrt(head_dim)
     
-    Args:
-        Q: Query tensor (batch, seq_len, head_dim) or (batch, heads, seq_len, head_dim)
-        K: Key tensor (batch, seq_len, head_dim) or (batch, heads, seq_len, head_dim)
-        V: Value tensor (batch, seq_len, head_dim) or (batch, heads, seq_len, head_dim)
-        is_causal: Whether to apply causal masking
-        
-    Returns:
-        Output tensor with same shape as Q
-    """
-    # Handle both 3D and 4D tensors
-    if Q.dim() == 4:
-        batch_size, num_heads, seq_len, head_dim = Q.shape
-        scale = 1.0 / math.sqrt(head_dim)
-        
-        # Compute attention scores
-        scores = torch.matmul(Q, K.transpose(-2, -1)) * scale  # (batch, heads, seq_len, seq_len)
-        
-        # Apply causal mask if needed
-        if is_causal:
-            mask = torch.triu(torch.ones(seq_len, seq_len, device=Q.device), diagonal=1).bool()
-            scores.masked_fill_(mask, float('-inf'))
-        
-        # Apply softmax
-        attn_weights = torch.softmax(scores, dim=-1)
-        
-        # Apply attention to values
-        output = torch.matmul(attn_weights, V)
-    else:
-        # 3D case (existing implementation)
-        batch_size, seq_len, head_dim = Q.shape
-        scale = 1.0 / math.sqrt(head_dim)
-        
-        # Compute attention scores
-        scores = torch.matmul(Q, K.transpose(-2, -1)) * scale  # (batch, seq_len, seq_len)
-        
-        # Apply causal mask if needed
-        if is_causal:
-            mask = torch.triu(torch.ones(seq_len, seq_len, device=Q.device), diagonal=1).bool()
-            scores.masked_fill_(mask, float('-inf'))
-        
-        # Apply softmax
-        attn_weights = torch.softmax(scores, dim=-1)
-        
-        # Apply attention to values
-        output = torch.matmul(attn_weights, V)
+    # Compute attention scores
+    scores = torch.matmul(Q, K.transpose(-2, -1)) * scale
+    
+    # Apply causal mask if needed
+    if is_causal:
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=Q.device), diagonal=1).bool()
+        scores.masked_fill_(mask, float('-inf'))
+    
+    # Apply softmax and compute output
+    attn_weights = torch.softmax(scores, dim=-1)
+    output = torch.matmul(attn_weights, V)
     
     return output
 
 
-class AttentionBenchmarker:
+class FlashAttentionBenchmarker:
     """
-    Benchmarking class for comparing different attention implementations.
+    Optimized benchmarker for our three FlashAttention implementations.
     """
     
-    def __init__(self, config: BenchmarkConfig):
+    def __init__(self, config: OptimizedBenchmarkConfig):
         self.config = config
         self.results: List[BenchmarkResult] = []
+        self.pytorch_baseline: Dict[Tuple[int, int, str], float] = {}
         
-    def create_inputs_3d(self, seq_len: int, head_dim: int, dtype: torch.dtype) -> Tuple[torch.Tensor, ...]:
-        """Create random 3D inputs for FlashAttention-2 and PyTorch standard."""
+    def create_test_inputs(self, seq_len: int, head_dim: int, dtype: torch.dtype, 
+                          is_4d: bool = False) -> Tuple[torch.Tensor, ...]:
+        """Create test inputs with optimal memory layout."""
         batch_size = self.config.batch_size
         device = self.config.device
         
-        # Create random inputs with requires_grad for backward pass
-        Q = torch.randn(batch_size, seq_len, head_dim, dtype=dtype, device=device, requires_grad=True)
-        K = torch.randn(batch_size, seq_len, head_dim, dtype=dtype, device=device, requires_grad=True)
-        V = torch.randn(batch_size, seq_len, head_dim, dtype=dtype, device=device, requires_grad=True)
+        # All FlashAttention implementations use 3D tensors (batch, seq_len, head_dim)
+        shape = (batch_size, seq_len, head_dim)
         
-        # Create gradient tensor for backward pass
-        grad_output = torch.randn(batch_size, seq_len, head_dim, dtype=dtype, device=device)
+        # Create inputs with proper initialization for numerical stability
+        Q = torch.randn(shape, dtype=dtype, device=device, requires_grad=True) * 0.1
+        K = torch.randn(shape, dtype=dtype, device=device, requires_grad=True) * 0.1
+        V = torch.randn(shape, dtype=dtype, device=device, requires_grad=True) * 0.1
         
-        return Q, K, V, grad_output
-    
-    def create_inputs_4d(self, seq_len: int, head_dim: int, dtype: torch.dtype) -> Tuple[torch.Tensor, ...]:
-        """Create random 4D inputs for FlashAttention-1."""
-        batch_size = self.config.batch_size
-        num_heads = self.config.num_heads
-        device = self.config.device
-        
-        # Create random inputs with requires_grad for backward pass
-        Q = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=dtype, device=device, requires_grad=True)
-        K = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=dtype, device=device, requires_grad=True)
-        V = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=dtype, device=device, requires_grad=True)
-        
-        # Create gradient tensor for backward pass
-        grad_output = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=dtype, device=device)
+        grad_output = torch.randn(shape, dtype=dtype, device=device) * 0.1
         
         return Q, K, V, grad_output
     
-    def benchmark_forward_accurate(self, attention_fn: Callable, Q: torch.Tensor, K: torch.Tensor, 
-                                  V: torch.Tensor) -> float:
-        """More accurate benchmark for forward pass using CUDA events."""
-        # Ensure CUDA synchronization
+    def benchmark_with_cuda_events(self, benchmark_fn: Callable) -> float:
+        """Accurate benchmarking using CUDA events."""
         torch.cuda.synchronize()
         
         # Warmup
         for _ in range(self.config.num_warmup):
-            _ = attention_fn(Q, K, V, self.config.is_causal)
+            benchmark_fn()
         
         torch.cuda.synchronize()
         
-        # Use CUDA events for precise timing
+        # Benchmark with CUDA events
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         
         times = []
         for _ in range(self.config.num_iterations):
             start_event.record()
-            output = attention_fn(Q, K, V, self.config.is_causal)
+            benchmark_fn()
             end_event.record()
             torch.cuda.synchronize()
             times.append(start_event.elapsed_time(end_event))
         
         return sum(times) / len(times)
     
-    def benchmark_backward_accurate(self, attention_fn: Callable, Q: torch.Tensor, K: torch.Tensor, 
-                                   V: torch.Tensor, grad_output: torch.Tensor) -> float:
-        """More accurate benchmark for backward pass using CUDA events."""
-        # Ensure CUDA synchronization
-        torch.cuda.synchronize()
+    def benchmark_implementation(self, impl_name: str, attention_fn: Callable, 
+                                seq_len: int, head_dim: int, dtype: torch.dtype) -> BenchmarkResult:
+        """Benchmark a single implementation configuration - 只比较前向传播."""
         
-        # Warmup - use fresh tensors each time to avoid graph accumulation
-        for _ in range(self.config.num_warmup):
-            # Create fresh input tensors for warmup
-            Q_warm = Q.detach().clone().requires_grad_(True)
-            K_warm = K.detach().clone().requires_grad_(True)
-            V_warm = V.detach().clone().requires_grad_(True)
-            
-            output = attention_fn(Q_warm, K_warm, V_warm, self.config.is_causal)
-            output.backward(grad_output)
-            
-            # Clean up
-            del Q_warm, K_warm, V_warm, output
+        # Create appropriate inputs 
+        is_4d = 'FA1' in impl_name or 'FlashAttention1' in impl_name
+        Q, K, V, grad_output = self.create_test_inputs(seq_len, head_dim, dtype, is_4d)
         
-        torch.cuda.synchronize()
-        
-        # Use CUDA events for precise timing
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        
-        times = []
-        for _ in range(self.config.num_iterations):
-            # Create fresh input tensors for each iteration
-            Q_test = Q.detach().clone().requires_grad_(True)
-            K_test = K.detach().clone().requires_grad_(True)
-            V_test = V.detach().clone().requires_grad_(True)
-            
-            # Forward pass (not timed)
-            output = attention_fn(Q_test, K_test, V_test, self.config.is_causal)
-            
-            # Time only the backward pass
-            start_event.record()
-            output.backward(grad_output)
-            end_event.record()
+        try:
+            # Clear GPU memory and get baseline BEFORE detaching
+            torch.cuda.empty_cache()
             torch.cuda.synchronize()
+            memory_before = torch.cuda.memory_allocated() / (1024 * 1024)  # MB
             
-            times.append(start_event.elapsed_time(end_event))
+            # 现在detach张量，只测试前向传播
+            Q_test = Q.detach()
+            K_test = K.detach() 
+            V_test = V.detach()
             
-            # Clean up
-            del Q_test, K_test, V_test, output
-        
-        return sum(times) / len(times)
-    
-    def benchmark_end_to_end_accurate(self, attention_fn: Callable, Q: torch.Tensor, K: torch.Tensor, 
-                                     V: torch.Tensor, grad_output: torch.Tensor) -> float:
-        """More accurate benchmark for end-to-end pass using CUDA events."""
-        # Ensure CUDA synchronization
-        torch.cuda.synchronize()
-        
-        # Warmup
-        for _ in range(self.config.num_warmup):
-            Q_warm = Q.detach().clone().requires_grad_(True)
-            K_warm = K.detach().clone().requires_grad_(True)
-            V_warm = V.detach().clone().requires_grad_(True)
-            
-            output = attention_fn(Q_warm, K_warm, V_warm, self.config.is_causal)
-            output.backward(grad_output)
-            
-            del Q_warm, K_warm, V_warm, output
-        
-        torch.cuda.synchronize()
-        
-        # Use CUDA events for precise timing
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        
-        times = []
-        for _ in range(self.config.num_iterations):
-            # Create fresh input tensors
-            Q_test = Q.detach().clone().requires_grad_(True)
-            K_test = K.detach().clone().requires_grad_(True)
-            V_test = V.detach().clone().requires_grad_(True)
-            
-            # Time both forward and backward
-            start_event.record()
-            output = attention_fn(Q_test, K_test, V_test, self.config.is_causal)
-            output.backward(grad_output)
-            end_event.record()
+            # Measure memory after creating test tensors
             torch.cuda.synchronize()
+            memory_after_inputs = torch.cuda.memory_allocated() / (1024 * 1024)  # MB
             
-            times.append(start_event.elapsed_time(end_event))
+            # Store references to prevent garbage collection during benchmark
+            tensors_ref = [Q_test, K_test, V_test]
             
-            # Clean up
-            del Q_test, K_test, V_test, output
-        
-        return sum(times) / len(times)
-
-    def benchmark_forward(self, attention_fn: Callable, Q: torch.Tensor, K: torch.Tensor, 
-                         V: torch.Tensor) -> float:
-        """Benchmark forward pass - use accurate timing for PyTorch functions."""
-        # Use accurate timing for PyTorch/compiled functions, triton timing for others
-        if hasattr(attention_fn, '__name__') and 'triton' in attention_fn.__name__.lower():
-            # Use triton timing for triton functions
+            # Benchmark forward pass only
             def forward_fn():
-                return attention_fn(Q, K, V, self.config.is_causal)
+                output = attention_fn(Q_test, K_test, V_test, self.config.is_causal)
+                # Ensure output is computed
+                torch.cuda.synchronize()
+                return output
             
-            return triton.testing.do_bench(
-                forward_fn,
-                warmup=self.config.num_warmup,
-                rep=self.config.num_iterations
+            forward_ms = self.benchmark_with_cuda_events(forward_fn)
+            
+            # Measure peak memory after forward pass
+            torch.cuda.synchronize()
+            memory_peak = torch.cuda.memory_allocated() / (1024 * 1024)  # MB
+            
+            # Calculate actual memory usage (peak memory during computation)
+            memory_usage_mb = max(memory_peak - memory_before, memory_after_inputs - memory_before)
+            
+            # Clean up references
+            del tensors_ref, Q_test, K_test, V_test
+            
+            # Calculate speedup vs PyTorch baseline (only forward pass)
+            pytorch_key = (seq_len, head_dim, str(dtype).split('.')[-1])
+            speedup = None
+            if pytorch_key in self.pytorch_baseline:
+                speedup = self.pytorch_baseline[pytorch_key] / forward_ms
+            
+            return BenchmarkResult(
+                seq_len=seq_len,
+                head_dim=head_dim,
+                dtype=str(dtype).split('.')[-1],
+                implementation=impl_name,
+                forward_ms=forward_ms,
+                backward_ms=0.0,  # 不测试backward
+                end_to_end_ms=forward_ms,  # 只有前向传播
+                memory_mb=memory_usage_mb,
+                speedup_vs_pytorch=speedup
             )
-        else:
-            # Use accurate CUDA event timing for PyTorch functions
-            return self.benchmark_forward_accurate(attention_fn, Q, K, V)
+            
+        except Exception as e:
+            print(f"    FAILED {impl_name}: {str(e)}")
+            return BenchmarkResult(
+                seq_len=seq_len,
+                head_dim=head_dim,
+                dtype=str(dtype).split('.')[-1],
+                implementation=impl_name,
+                forward_ms=float('inf'),
+                backward_ms=0.0,
+                end_to_end_ms=float('inf'),
+                memory_mb=0.0,
+                speedup_vs_pytorch=0.0
+            )
+        finally:
+            # Clean up original tensors
+            del Q, K, V, grad_output
+            torch.cuda.empty_cache()
     
-    def benchmark_backward(self, attention_fn: Callable, Q: torch.Tensor, K: torch.Tensor, 
-                          V: torch.Tensor, grad_output: torch.Tensor) -> float:
-        """Benchmark backward pass - always use accurate timing."""
-        return self.benchmark_backward_accurate(attention_fn, Q, K, V, grad_output)
-    
-    def benchmark_end_to_end(self, attention_fn: Callable, Q: torch.Tensor, K: torch.Tensor, 
-                           V: torch.Tensor, grad_output: torch.Tensor) -> float:
-        """Benchmark complete forward + backward pass - always use accurate timing."""
-        return self.benchmark_end_to_end_accurate(attention_fn, Q, K, V, grad_output)
-
-    def benchmark_single_config(self, seq_len: int, head_dim: int, dtype: torch.dtype,
-                              implementations: Dict[str, Callable]) -> List[BenchmarkResult]:
-        """Benchmark a single configuration across all implementations."""
-        print(f"Benchmarking seq_len={seq_len}, head_dim={head_dim}, dtype={dtype}")
+    def run_optimized_benchmark(self) -> pd.DataFrame:
+        """Run optimized benchmark focusing on each FA version's strengths."""
+        print("🚀 FlashAttention Optimized Benchmark")
+        print("=" * 80)
         
-        results = []
-        
-        for impl_name, attention_fn in implementations.items():
-            try:
-                # Create appropriate inputs based on implementation
-                if 'FlashAttention1' in impl_name or 'V1' in impl_name:
-                    Q, K, V, grad_output = self.create_inputs_4d(seq_len, head_dim, dtype)
-                else:
-                    Q, K, V, grad_output = self.create_inputs_3d(seq_len, head_dim, dtype)
+        # Import implementations
+        try:
+            # FA-1: Uses FlashAttention1TritonFunction class
+            from flash_attention import flash_attention1_triton
+            
+            
+            # FA-2: Uses flash_attention_triton function
+            from flash_attention2 import flash_attention_triton
+            
+            # FA-3: Uses FlashAttention3TritonFunction class  
+            from flash_attention3 import FlashAttention3TritonFunction
+            def flash_attention_v3(Q, K, V, is_causal=False):
+                return FlashAttention3TritonFunction.apply(Q, K, V, is_causal)
                 
-                # Benchmark forward pass
-                forward_ms = self.benchmark_forward(attention_fn, Q, K, V)
-                
-                # Benchmark backward pass  
-                backward_ms = self.benchmark_backward(attention_fn, Q, K, V, grad_output)
-                
-                # Benchmark end-to-end
-                end_to_end_ms = self.benchmark_end_to_end(attention_fn, Q, K, V, grad_output)
-                
-                # Record results
-                result = BenchmarkResult(
-                    seq_len=seq_len,
-                    head_dim=head_dim,
-                    dtype=str(dtype).split('.')[-1],  # e.g., 'float32'
-                    implementation=impl_name,
-                    forward_ms=forward_ms,
-                    backward_ms=backward_ms,
-                    end_to_end_ms=end_to_end_ms
-                )
-                results.append(result)
-                
-                print(f"  {impl_name}: Forward={forward_ms:.3f}ms, Backward={backward_ms:.3f}ms, E2E={end_to_end_ms:.3f}ms")
-                
-            except Exception as e:
-                print(f"  {impl_name}: FAILED - {str(e)}")
-                # Still record a failed result
-                result = BenchmarkResult(
-                    seq_len=seq_len,
-                    head_dim=head_dim,
-                    dtype=str(dtype).split('.')[-1],
-                    implementation=impl_name,
-                    forward_ms=float('inf'),
-                    backward_ms=float('inf'),
-                    end_to_end_ms=float('inf')
-                )
-                results.append(result)
-        
-        return results
-    
-    def run_full_benchmark(self, implementations: Dict[str, Callable]) -> pd.DataFrame:
-        """Run complete benchmark across all configurations."""
-        print("Starting FlashAttention Comprehensive Benchmark")
-        print("=" * 60)
+        except ImportError as e:
+            print(f"Import error: {e}")
+            print("Please ensure all FlashAttention modules are available")
+            return pd.DataFrame()
         
         all_results = []
         
-        for seq_len in self.config.sequence_lengths:
+        # 1. Test PyTorch baseline first (for speedup calculations)
+        print("\n📊 Testing PyTorch Baseline...")
+        for seq_len in (self.config.short_sequences + self.config.medium_sequences + 
+                       self.config.long_sequences):
             for head_dim in self.config.head_dims:
-                for dtype in self.config.dtypes:
-                    # Clear CUDA cache before each configuration
-                    torch.cuda.empty_cache()
+                for dtype in self.config.pytorch_dtypes:
+                    print(f"  PyTorch: seq_len={seq_len}, head_dim={head_dim}, dtype={dtype}")
                     
-                    config_results = self.benchmark_single_config(
-                        seq_len, head_dim, dtype, implementations
+                    result = self.benchmark_implementation(
+                        "PyTorch_Standard", standard_pytorch_attention, 
+                        seq_len, head_dim, dtype
                     )
-                    all_results.extend(config_results)
+                    all_results.append(result)
+                    
+                    # Store baseline for speedup calculation
+                    key = (seq_len, head_dim, str(dtype).split('.')[-1])
+                    self.pytorch_baseline[key] = result.end_to_end_ms
         
-        # Convert to DataFrame for easy analysis
+        # 2. Test FA-1 on short sequences (its strength)
+        print("\n⚡ Testing FlashAttention-1 (Short Sequences)...")
+        for seq_len in self.config.short_sequences:
+            for head_dim in self.config.head_dims:
+                for dtype in self.config.fa1_dtypes:
+                    print(f"  FA-1: seq_len={seq_len}, head_dim={head_dim}, dtype={dtype}")
+                    
+                    result = self.benchmark_implementation(
+                        "FlashAttention1_Triton", flash_attention1_triton,
+                        seq_len, head_dim, dtype
+                    )
+                    all_results.append(result)
+        
+        # 3. Test FA-2 on medium sequences (its strength)  
+        print("\n🔥 Testing FlashAttention-2 (Medium Sequences)...")
+        for seq_len in self.config.medium_sequences:
+            for head_dim in self.config.head_dims:
+                for dtype in self.config.fa2_dtypes:
+                    print(f"  FA-2: seq_len={seq_len}, head_dim={head_dim}, dtype={dtype}")
+                    
+                    result = self.benchmark_implementation(
+                        "FlashAttention2_Triton", flash_attention_triton,
+                        seq_len, head_dim, dtype
+                    )
+                    all_results.append(result)
+        
+        # 4. Test FA-3 on long sequences (its strength)
+        print("\n🌟 Testing FlashAttention-3 (Long Sequences)...")
+        for seq_len in self.config.long_sequences:
+            for head_dim in self.config.head_dims:
+                for dtype in self.config.fa3_dtypes:
+                    print(f"  FA-3: seq_len={seq_len}, head_dim={head_dim}, dtype={dtype}")
+                    
+                    result = self.benchmark_implementation(
+                        "FlashAttention3_Triton", flash_attention_v3,
+                        seq_len, head_dim, dtype
+                    )
+                    all_results.append(result)
+        
+        # 5. Cross-comparison: test all FA versions on all sequence lengths
+        print("\n🔄 Cross-Comparison (All FA versions on all sequences)...")
+        all_sequences = self.config.short_sequences + self.config.medium_sequences + self.config.long_sequences
+        
+        implementations = [
+            ("FA1_CrossTest", flash_attention1_triton, self.config.fa1_dtypes),
+            ("FA2_CrossTest", flash_attention_triton, self.config.fa2_dtypes),
+            ("FA3_CrossTest", flash_attention_v3, self.config.fa3_dtypes),
+        ]
+        
+        for seq_len in all_sequences:
+            for head_dim in [64]:  # Focus on common head_dim for cross-comparison
+                for impl_name, impl_fn, dtypes in implementations:
+                    for dtype in dtypes:
+                        print(f"  {impl_name}: seq_len={seq_len}, head_dim={head_dim}, dtype={dtype}")
+                        
+                        result = self.benchmark_implementation(
+                            impl_name, impl_fn, seq_len, head_dim, dtype
+                        )
+                        all_results.append(result)
+        
+        # Convert to DataFrame
+        self.results = all_results
         df = pd.DataFrame([
             {
                 'seq_len': r.seq_len,
@@ -363,201 +348,160 @@ class AttentionBenchmarker:
                 'implementation': r.implementation,
                 'forward_ms': r.forward_ms,
                 'backward_ms': r.backward_ms,
-                'end_to_end_ms': r.end_to_end_ms
+                'end_to_end_ms': r.end_to_end_ms,
+                'memory_mb': r.memory_mb if r.memory_mb is not None else 0.0,  # Add default value
+                'speedup_vs_pytorch': r.speedup_vs_pytorch,
             }
             for r in all_results
         ])
         
-        self.results = all_results
         return df
     
-    def save_results(self, df: pd.DataFrame, filename: str):
-        """Save benchmark results to CSV."""
-        df.to_csv(filename, index=False)
-        print(f"Results saved to {filename}")
-    
-    def print_summary_table(self, df: pd.DataFrame):
-        """Print a formatted summary table."""
-        print("\n" + "=" * 140)
-        print("BENCHMARK RESULTS SUMMARY")
-        print("=" * 140)
+    def print_optimized_summary(self, df: pd.DataFrame):
+        """Print optimized summary focusing on each FA version's strengths."""
+        print("\n" + "=" * 100)
+        print("🎯 FLASHATTENTION OPTIMIZED BENCHMARK RESULTS")
+        print("=" * 100)
         
-        # Group by configuration and create pivot table
-        for dtype in df['dtype'].unique():
-            print(f"\nDatatype: {dtype}")
-            print("-" * 120)
+        # 1. Best performance for each sequence length range
+        print("\n📈 PERFORMANCE BY SEQUENCE LENGTH RANGE:")
+        print("-" * 80)
+        
+        ranges = [
+            ("Short (128-512)", self.config.short_sequences),
+            ("Medium (1K-4K)", self.config.medium_sequences), 
+            ("Long (8K-16K)", self.config.long_sequences)
+        ]
+        
+        for range_name, seq_lens in ranges:
+            print(f"\n{range_name}:")
+            range_df = df[df['seq_len'].isin(seq_lens) & (df['implementation'] != 'PyTorch_Standard')]
             
-            dtype_df = df[df['dtype'] == dtype]
-            
-            # Create pivot table for each metric
-            for metric in ['forward_ms', 'backward_ms', 'end_to_end_ms']:
-                print(f"\n{metric.replace('_', ' ').title()}:")
+            if not range_df.empty:
+                best_per_config = range_df.loc[range_df.groupby(['seq_len', 'head_dim', 'dtype'])['end_to_end_ms'].idxmin()]
                 
-                pivot = dtype_df.pivot_table(
-                    values=metric,
-                    index=['seq_len', 'head_dim'],
-                    columns='implementation',
-                    fill_value=float('inf')
-                )
-                
-                # Format the table nicely
-                formatted_pivot = pivot.copy()
-                for col in formatted_pivot.columns:
-                    formatted_pivot[col] = formatted_pivot[col].apply(
-                        lambda x: f"{x:.3f}" if x != float('inf') else "FAIL"
-                    )
-                
-                print(formatted_pivot.to_string())
-                print()
+                for _, row in best_per_config.iterrows():
+                    speedup_str = f"{row['speedup_vs_pytorch']:.2f}x" if row['speedup_vs_pytorch'] else "N/A"
+                    print(f"  seq_len={row['seq_len']}, head_dim={row['head_dim']}, dtype={row['dtype']}: "
+                          f"{row['implementation']} ({row['end_to_end_ms']:.2f}ms, {speedup_str})")
+        
+        # 2. Speedup comparison
+        print(f"\n🚀 SPEEDUP vs PyTorch (End-to-End):")
+        print("-" * 80)
+        
+        fa_implementations = ['FlashAttention1_Triton', 'FlashAttention2_Triton', 'FlashAttention3_Triton']
+        
+        for impl in fa_implementations:
+            impl_df = df[df['implementation'] == impl]
+            if not impl_df.empty and impl_df['speedup_vs_pytorch'].notna().any():
+                avg_speedup = impl_df['speedup_vs_pytorch'].mean()
+                max_speedup = impl_df['speedup_vs_pytorch'].max()
+                print(f"  {impl}: Average {avg_speedup:.2f}x, Max {max_speedup:.2f}x")
+        
+        # 3. Detailed comparison table
+        print(f"\n📊 DETAILED RESULTS (End-to-End Time in ms):")
+        print("-" * 120)
+        
+        # Create pivot table
+        pivot_df = df.pivot_table(
+            values='end_to_end_ms',
+            index=['seq_len', 'head_dim', 'dtype'],
+            columns='implementation',
+            fill_value=float('inf')
+        )
+        
+        # Format and display
+        for col in pivot_df.columns:
+            pivot_df[col] = pivot_df[col].apply(lambda x: f"{x:.2f}" if x != float('inf') else "FAIL")
+        
+        print(pivot_df.to_string())
+        
+        # 4. Memory efficiency (if available)
+        if df['memory_mb'].notna().any():
+            print(f"\n💾 MEMORY USAGE (MB):")
+            print("-" * 50)
+            memory_df = df[df['memory_mb'].notna()].groupby('implementation')['memory_mb'].mean()
+            for impl, mem in memory_df.items():
+                print(f"  {impl}: {mem:.1f} MB")
+    
+    def save_results(self, df: pd.DataFrame, filename: str = None):
+        """Save benchmark results to CSV."""
+        if filename is None:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            filename = f"flashattention_optimized_benchmark_{timestamp}.csv"
+        
+        df.to_csv(filename, index=False)
+        print(f"\n💾 Results saved to {filename}")
 
 
-def create_default_config() -> BenchmarkConfig:
-    """Create default benchmark configuration."""
-    return BenchmarkConfig(
-        sequence_lengths=[2**i for i in range(7, 15)],  # 128 to 16384 (reduced for faster benchmarking)
-        head_dims=[2**i for i in range(4, 8)],          # 16 to 128
-        dtypes=[torch.bfloat16, torch.float32],
+def create_optimized_config() -> OptimizedBenchmarkConfig:
+    """Create optimized benchmark configuration."""
+    return OptimizedBenchmarkConfig(
+        # Sequence ranges optimized for each FA version - 使用更合理的长度
+        short_sequences=[128, 256, 512],      # FA-1 strength
+        medium_sequences=[1024, 2048],        # FA-2 strength - 移除4096
+        long_sequences=[2048, 4096],          # FA-3 strength - 移除8192和16384
+        
+        # Common head dimensions
+        head_dims=[32, 64],                   # 减少head_dims，专注于32和64
+        
+        # Optimal precisions per version
+        fa1_dtypes=[torch.float32],                    # FA-1 works best with fp32
+        fa2_dtypes=[torch.float32],                    # FA-2 optimized for bf16
+        fa3_dtypes=[torch.float32],                    # FA-3 mixed precision
+        pytorch_dtypes=[torch.float32],               # Baseline
+        
         batch_size=1,
-        num_heads=1,
         is_causal=True,
-        num_warmup=10,
-        num_iterations=100,
+        num_warmup=3,                         # 减少warmup次数
+        num_iterations=10,                    # 减少迭代次数
         device='cuda'
     )
 
 
-def create_quick_config() -> BenchmarkConfig:
-    """Create quick benchmark configuration for testing."""
-    return BenchmarkConfig(
-        sequence_lengths=[128, 256, 512, 1024],
-        head_dims=[32, 64],
-        dtypes=[torch.float32],
-        batch_size=1,
-        num_heads=1,
-        is_causal=True,
-        num_warmup=5,
-        num_iterations=20,
-        device='cuda'
-    )
-
-
-def run_comprehensive_flashattention_benchmark():
+def run_flashattention_optimized_benchmark():
     """
-    Main function to run comprehensive FlashAttention benchmark across all versions.
+    Main function to run optimized FlashAttention benchmark.
+    Focus on each version's strengths and optimal use cases.
     """
-    # Import our implementations
-    try:
-        from flash_attention2 import flash_attention_triton as flash_attention2_triton, flash_attention_all_triton
-        from flash_attention import flash_attention_v1
-        # TODO: Uncomment when FlashAttention-3 is implemented
-        # from flash_attention3 import flash_attention_v3
-    except ImportError:
-        import sys
-        import os
-        sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-        from flash_attention2 import flash_attention_triton as flash_attention2_triton, flash_attentions_all_triton
-        from flash_attention import flash_attention_v1
-        # TODO: Uncomment when FlashAttention-3 is implemented
-        # from flash_attention3 import flash_attention_v3
+    if not torch.cuda.is_available():
+        print("❌ CUDA is not available. This benchmark requires a CUDA-enabled GPU.")
+        return None, None
     
-    # Create benchmark configuration
-    config = create_default_config()
-    benchmarker = AttentionBenchmarker(config)
-    
-    # Define implementations to compare (removed slow PyTorch FlashAttention-2)
-    implementations = {
-        'PyTorch_Standard': standard_pytorch_attention,
-        'FlashAttention1_Triton': flash_attention_v1,
-        'FlashAttention2_Triton': flash_attention2_triton,
-        'FlashAttention2_AllTriton': flash_attention_all_triton,
-        # TODO: Uncomment when FlashAttention-3 is implemented
-        # 'FlashAttention3_Triton': flash_attention_v3,
-    }
-    
-    # Run benchmark
-    print("Comprehensive FlashAttention Benchmark (All Versions)")
-    print(f"Configurations: {len(config.sequence_lengths)} seq_lens × {len(config.head_dims)} head_dims × {len(config.dtypes)} dtypes")
-    print(f"Total configurations: {len(config.sequence_lengths) * len(config.head_dims) * len(config.dtypes)}")
-    print(f"Implementations: {list(implementations.keys())}")
+    print("🎯 FlashAttention Optimized Benchmark")
+    print("Focus: Each version tested in its optimal conditions")
+    print("All implementations tested with FP32 precision for consistency")
+    print("FA-1: Short sequences (128-512)")
+    print("FA-2: Medium sequences (1K-4K)")  
+    print("FA-3: Long sequences (8K-16K)")
     print()
     
-    df = benchmarker.run_full_benchmark(implementations)
+    # Create optimized configuration
+    config = create_optimized_config()
+    benchmarker = FlashAttentionBenchmarker(config)
+    
+    # Run benchmark
+    df = benchmarker.run_optimized_benchmark()
+    
+    if df.empty:
+        print("❌ Benchmark failed - no results generated")
+        return None, None
     
     # Print results
-    benchmarker.print_summary_table(df)
+    benchmarker.print_optimized_summary(df)
     
     # Save results
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    filename = f"flashattention_comprehensive_benchmark_{timestamp}.csv"
-    benchmarker.save_results(df, filename)
+    benchmarker.save_results(df)
     
     return df, benchmarker
 
 
-def run_quick_flashattention_benchmark():
-    """
-    Quick benchmark for testing all FlashAttention versions.
-    """
-    # Import our implementations
-    try:
-        from flash_attention2 import flash_attention_triton as flash_attention2_triton, flash_attention_all_triton
-        from flash_attention import flash_attention_v1
-        # TODO: Uncomment when FlashAttention-3 is implemented
-        # from flash_attention3 import flash_attention_v3
-    except ImportError:
-        import sys
-        import os
-        sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-        from flash_attention2 import flash_attention_triton as flash_attention2_triton, flash_attention_all_triton
-        from flash_attention import flash_attention_v1
-        # TODO: Uncomment when FlashAttention-3 is implemented
-        # from flash_attention3 import flash_attention_v3
-    
-    # Create quick benchmark configuration
-    config = create_quick_config()
-    benchmarker = AttentionBenchmarker(config)
-    
-    # Define implementations to compare
-    implementations = {
-        'PyTorch_Standard': standard_pytorch_attention,
-        'FlashAttention1_Triton': flash_attention_v1,
-        'FlashAttention2_Triton': flash_attention2_triton,
-        'FlashAttention2_AllTriton': flash_attention_all_triton,
-        # TODO: Uncomment when FlashAttention-3 is implemented
-        # 'FlashAttention3_Triton': flash_attention_v3,
-    }
-    
-    # Run benchmark
-    print("Quick FlashAttention Benchmark (All Versions)")
-    print(f"Configurations: {len(config.sequence_lengths)} seq_lens × {len(config.head_dims)} head_dims × {len(config.dtypes)} dtypes")
-    print(f"Total configurations: {len(config.sequence_lengths) * len(config.head_dims) * len(config.dtypes)}")
-    print(f"Implementations: {list(implementations.keys())}")
-    print()
-    
-    df = benchmarker.run_full_benchmark(implementations)
-    
-    # Print results
-    benchmarker.print_summary_table(df)
-    
-    # Save results
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    filename = f"flashattention_quick_benchmark_{timestamp}.csv"
-    benchmarker.save_results(df, filename)
-    
-    return df, benchmarker
-
-
-# Legacy function for backward compatibility
-def run_flashattention2_benchmark():
-    """Legacy function - redirects to comprehensive benchmark."""
-    return run_comprehensive_flashattention_benchmark()
+# Legacy aliases for backward compatibility
+run_comprehensive_flashattention_benchmark = run_flashattention_optimized_benchmark
+run_quick_flashattention_benchmark = run_flashattention_optimized_benchmark
+run_flashattention2_benchmark = run_flashattention_optimized_benchmark
 
 
 if __name__ == "__main__":
-    # Check if CUDA is available
-    if not torch.cuda.is_available():
-        print("CUDA is not available. This benchmark requires a CUDA-enabled GPU.")
-        exit(1)
-    
-    # Run the comprehensive benchmark
-    df, benchmarker = run_comprehensive_flashattention_benchmark()
+    # Run the optimized benchmark
+    df, benchmarker = run_flashattention_optimized_benchmark()

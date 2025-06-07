@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Comprehensive FlashAttention Benchmark Runner
+Optimized FlashAttention Benchmark Runner
 
-Run comprehensive benchmarks comparing all FlashAttention implementations
-(v1, v2, and v3 when available) with standard PyTorch attention.
+Run optimized benchmarks comparing our three FlashAttention implementations
+(FA-1, FA-2, FA-3) with standard PyTorch attention, focusing on each version's
+optimal conditions and data precisions.
+
+Usage: uv run utils/run_benchmark.py
 """
 
 import sys
@@ -12,268 +15,415 @@ import os
 # Add the parent directory to the path so we can import flash_attention modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Check dependencies
-try:
-    import pandas as pd
-except ImportError:
-    print("Installing pandas for benchmark results...")
-    import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "pandas"])
-    import pandas as pd
-
+# Import dependencies (managed by uv)
+import pandas as pd
 import torch
 import triton
 from utils.benchmark import (
-    run_comprehensive_flashattention_benchmark, 
-    run_quick_flashattention_benchmark,
-    create_default_config, 
-    create_quick_config,
-    AttentionBenchmarker
+    run_flashattention_optimized_benchmark,
+    create_optimized_config,
+    FlashAttentionBenchmarker,
+    OptimizedBenchmarkConfig,
+    standard_pytorch_attention
 )
 
 
-def run_custom_benchmark():
-    """Run a custom benchmark with user-specified configurations."""
-    from utils.benchmark import BenchmarkConfig, standard_pytorch_attention
+def run_quick_optimized_benchmark():
+    """Run a quick optimized benchmark with reduced configurations."""
+    # Create quick config with fewer test cases
+    config = OptimizedBenchmarkConfig(
+        short_sequences=[128, 256],          # FA-1 strength (reduced)
+        medium_sequences=[256, 512],       # FA-2 strength (reduced)  
+        long_sequences=[1024, 2048],         # FA-3 using same as FA-2 to avoid hanging
+        head_dims=[64],                      # Focus on common head_dim
+        fa1_dtypes=[torch.float32],          # Only FP32
+        fa2_dtypes=[torch.float32],          # Only FP32
+        fa3_dtypes=[torch.float32],          # Only FP32
+        pytorch_dtypes=[torch.float32],      # Only FP32
+        batch_size=1,
+        is_causal=True,
+        num_warmup=5,
+        num_iterations=10,                   # Fewer iterations for speed
+        device='cuda'
+    )
     
-    try:
-        from flash_attention2 import flash_attention_triton as flash_attention2_triton, flash_attention_all_triton
-        from flash_attention import flash_attention_v1
-        # TODO: Uncomment when FlashAttention-3 is implemented
-        # from flash_attention3 import flash_attention_v3
-    except ImportError as e:
-        print(f"Failed to import FlashAttention implementations: {e}")
-        return
+    benchmarker = FlashAttentionBenchmarker(config)
     
-    print("Custom Benchmark Configuration")
-    print("=" * 40)
+    print("🚀 Quick Optimized FlashAttention Benchmark")
+    print("Focus: Each version tested in its sweet spot")
+    print("Reduced configurations for faster execution")
+    print()
     
-    # Get user preferences
-    print("Available sequence lengths: 128, 256, 512, 1024, 2048, 4096, 8192, 16384")
-    seq_input = input("Enter sequence lengths (comma-separated, or press Enter for default): ").strip()
-    if seq_input:
+    df = benchmarker.run_optimized_benchmark()
+    
+    if df.empty:
+        print("❌ Quick benchmark failed")
+        return None, None
+    
+    benchmarker.print_optimized_summary(df)
+    return df, benchmarker
+
+
+def run_custom_optimized_benchmark():
+    """Run a custom benchmark with user-specified optimizations."""
+    print("Custom Optimized Benchmark Configuration")
+    print("=" * 50)
+    
+    # Get user preferences for sequence ranges
+    print("Configure sequence length ranges for each FA version:")
+    
+    # FA-1 sequences
+    fa1_input = input("FA-1 sequences (comma-separated, default: 128,256,512): ").strip()
+    if fa1_input:
         try:
-            sequence_lengths = [int(x.strip()) for x in seq_input.split(',')]
+            short_sequences = [int(x.strip()) for x in fa1_input.split(',')]
         except ValueError:
-            print("Invalid input, using default sequence lengths")
-            sequence_lengths = [128, 512, 1024, 2048]
+            print("Invalid input, using default")
+            short_sequences = [128, 256, 512]
     else:
-        sequence_lengths = [128, 512, 1024, 2048]
+        short_sequences = [128, 256, 512]
     
-    print("Available head dimensions: 16, 32, 64, 128")
-    head_input = input("Enter head dimensions (comma-separated, or press Enter for default): ").strip()
+    # FA-2 sequences
+    fa2_input = input("FA-2 sequences (comma-separated, default: 1024,2048,4096): ").strip()
+    if fa2_input:
+        try:
+            medium_sequences = [int(x.strip()) for x in fa2_input.split(',')]
+        except ValueError:
+            print("Invalid input, using default")
+            medium_sequences = [1024, 2048, 4096]
+    else:
+        medium_sequences = [1024, 2048, 4096]
+    
+    # FA-3 sequences
+    fa3_input = input("FA-3 sequences (comma-separated, default: 8192,16384): ").strip()
+    if fa3_input:
+        try:
+            long_sequences = [int(x.strip()) for x in fa3_input.split(',')]
+        except ValueError:
+            print("Invalid input, using default")
+            long_sequences = [4096, 8192]
+    else:
+        long_sequences = [4096, 8192]
+    
+    # Head dimensions
+    head_input = input("Head dimensions (comma-separated, default: 32,64,128): ").strip()
     if head_input:
         try:
             head_dims = [int(x.strip()) for x in head_input.split(',')]
         except ValueError:
-            print("Invalid input, using default head dimensions")
-            head_dims = [32, 64]
+            print("Invalid input, using default")
+            head_dims = [4, 16, 64]
     else:
-        head_dims = [32, 64]
+        head_dims = [4, 16, 64]
     
-    print("Available dtypes: float32, bfloat16")
-    dtype_input = input("Enter dtypes (comma-separated, or press Enter for default): ").strip()
-    if dtype_input:
+    # Precision selection
+    print("\nPrecision configuration:")
+    print("FA-1 works best with float32")
+    print("FA-2 is optimized for bfloat16") 
+    print("FA-3 uses mixed precision (bfloat16)")
+    
+    use_optimal = input("Use optimal precisions for each version? (Y/n): ").strip().lower()
+    if use_optimal in ['n', 'no']:
+        # Let user choose precisions
         dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16}
-        try:
-            dtypes = [dtype_map[x.strip()] for x in dtype_input.split(',') if x.strip() in dtype_map]
-            if not dtypes:
-                raise ValueError("No valid dtypes")
-        except (ValueError, KeyError):
-            print("Invalid input, using default dtypes")
-            dtypes = [torch.float32]
+        
+        fa1_dtype_input = input("FA-1 dtypes (float32,bfloat16, default: float32): ").strip()
+        fa1_dtypes = [dtype_map.get(x.strip(), torch.float32) for x in fa1_dtype_input.split(',') if x.strip()]
+        if not fa1_dtypes:
+            fa1_dtypes = [torch.float32]
+        
+        fa2_dtype_input = input("FA-2 dtypes (float32,bfloat16, default: bfloat16): ").strip()
+        fa2_dtypes = [dtype_map.get(x.strip(), torch.bfloat16) for x in fa2_dtype_input.split(',') if x.strip()]
+        if not fa2_dtypes:
+            fa2_dtypes = [torch.bfloat16]
+        
+        fa3_dtype_input = input("FA-3 dtypes (float32,bfloat16, default: bfloat16): ").strip()
+        fa3_dtypes = [dtype_map.get(x.strip(), torch.bfloat16) for x in fa3_dtype_input.split(',') if x.strip()]
+        if not fa3_dtypes:
+            fa3_dtypes = [torch.bfloat16]
     else:
-        dtypes = [torch.float32]
+        # Use optimal precisions
+        fa1_dtypes = [torch.float32]
+        fa2_dtypes = [torch.bfloat16]
+        fa3_dtypes = [torch.bfloat16]
     
-    # Custom config
-    config = BenchmarkConfig(
-        sequence_lengths=sequence_lengths,
+    # Create custom config
+    config = OptimizedBenchmarkConfig(
+        short_sequences=short_sequences,
+        medium_sequences=medium_sequences,
+        long_sequences=long_sequences,
         head_dims=head_dims,
-        dtypes=dtypes,
+        fa1_dtypes=fa1_dtypes,
+        fa2_dtypes=fa2_dtypes,
+        fa3_dtypes=fa3_dtypes,
+        pytorch_dtypes=[torch.float32],
         batch_size=1,
-        num_heads=1,
         is_causal=True,
         num_warmup=5,
         num_iterations=20,
         device='cuda'
     )
     
-    benchmarker = AttentionBenchmarker(config)
+    benchmarker = FlashAttentionBenchmarker(config)
     
-    # Ask which implementations to include
-    print("\nAvailable implementations:")
-    print("1. PyTorch Standard")
-    print("2. FlashAttention v1 (Triton)")
-    print("3. FlashAttention v2 (Triton)")
-    print("4. FlashAttention v2 All-Triton (Full Triton forward+backward)")
-    # print("5. FlashAttention v3 (Triton)")  # TODO: Uncomment when v3 is available
+    print(f"\nRunning Custom Optimized FlashAttention Benchmark")
+    print(f"FA-1: {len(short_sequences)} sequences × {len(head_dims)} head_dims × {len(fa1_dtypes)} dtypes")
+    print(f"FA-2: {len(medium_sequences)} sequences × {len(head_dims)} head_dims × {len(fa2_dtypes)} dtypes") 
+    print(f"FA-3: {len(long_sequences)} sequences × {len(head_dims)} head_dims × {len(fa3_dtypes)} dtypes")
+    print("=" * 80)
     
-    impl_input = input("Select implementations to benchmark (e.g., '1,2,3,4' or press Enter for all): ").strip()
+    df = benchmarker.run_optimized_benchmark()
     
-    all_implementations = {
-        '1': ('PyTorch_Standard', standard_pytorch_attention),
-        '2': ('FlashAttention1_Triton', flash_attention_v1),
-        '3': ('FlashAttention2_Triton', flash_attention2_triton),
-        '4': ('FlashAttention2_AllTriton', flash_attention2_all_triton),
-        # '5': ('FlashAttention3_Triton', flash_attention_v3),  # TODO: Uncomment when v3 is available
-    }
-    
-    if impl_input:
-        try:
-            selected = impl_input.split(',')
-            implementations = {name: func for idx, (name, func) in all_implementations.items() if idx in selected}
-        except:
-            print("Invalid selection, using all implementations")
-            implementations = {name: func for name, func in all_implementations.values()}
-    else:
-        implementations = {name: func for name, func in all_implementations.values()}
-    
-    if not implementations:
-        print("No valid implementations selected, using all")
-        implementations = {name: func for name, func in all_implementations.values()}
-    
-    print(f"\nRunning Custom FlashAttention Benchmark")
-    print(f"Configurations: {len(sequence_lengths)} seq_lens × {len(head_dims)} head_dims × {len(dtypes)} dtypes")
-    print(f"Implementations: {list(implementations.keys())}")
-    print("=" * 60)
-    
-    df = benchmarker.run_full_benchmark(implementations)
-    benchmarker.print_summary_table(df)
-    
+    if df.empty:
+        print("❌ Custom benchmark failed")
+        return None, None
+        
+    benchmarker.print_optimized_summary(df)
     return df, benchmarker
 
 
-def run_performance_comparison():
-    """Run a focused performance comparison between FlashAttention versions."""
-    from utils.benchmark import BenchmarkConfig, standard_pytorch_attention
+def run_version_comparison():
+    """Run a focused comparison between FA versions at their optimal conditions."""
+    print("FlashAttention Version Comparison")
+    print("Testing each version at its optimal sequence length and precision")
+    print("=" * 70)
     
+    # Import implementations
     try:
-        from flash_attention2 import flash_attention_triton as flash_attention2_triton, flash_attention2_all_triton
-        from flash_attention import flash_attention_v1
-        # TODO: Uncomment when FlashAttention-3 is implemented
-        # from flash_attention3 import flash_attention_v3
+        # FA-1: Uses flash_attention1_triton function
+        from flash_attention import flash_attention1_triton
+        
+        # FA-2: Uses flash_attention_triton function
+        from flash_attention2 import flash_attention_triton
+        
+        # FA-3: Uses FlashAttention3TritonFunction class  
+        from flash_attention3 import FlashAttention3TritonFunction
+        def flash_attention_v3(Q, K, V, is_causal=False):
+            return FlashAttention3TritonFunction.apply(Q, K, V, is_causal)
+            
     except ImportError as e:
         print(f"Failed to import FlashAttention implementations: {e}")
-        return
+        return None, None
     
-    # Performance-focused config - test larger sequences where differences are more apparent
-    config = BenchmarkConfig(
-        sequence_lengths=[1024, 2048, 4096, 8192],  # Focus on larger sequences
-        head_dims=[64, 128],  # Common head dimensions
-        dtypes=[torch.bfloat16],  # Use bfloat16 for better performance
+    # Create focused comparison config
+    config = OptimizedBenchmarkConfig(
+        short_sequences=[512],        # FA-1 optimal
+        medium_sequences=[2048],      # FA-2 optimal
+        long_sequences=[8192],        # FA-3 optimal
+        head_dims=[64, 128],          # Common dimensions
+        fa1_dtypes=[torch.float32],   # Only FP32
+        fa2_dtypes=[torch.float32],   # Only FP32
+        fa3_dtypes=[torch.float32],   # Only FP32
+        pytorch_dtypes=[torch.float32],
         batch_size=1,
-        num_heads=1,
         is_causal=True,
         num_warmup=10,
-        num_iterations=50,  # More iterations for stable measurements
+        num_iterations=30,            # More iterations for precision
         device='cuda'
     )
     
-    benchmarker = AttentionBenchmarker(config)
+    benchmarker = FlashAttentionBenchmarker(config)
+    df = benchmarker.run_optimized_benchmark()
     
-    implementations = {
-        'PyTorch_Standard': standard_pytorch_attention,
-        'FlashAttention1_Triton': flash_attention_v1,
-        'FlashAttention2_Triton': flash_attention2_triton,
-        'FlashAttention2_AllTriton': flash_attention2_all_triton,
-        # TODO: Uncomment when FlashAttention-3 is implemented
-        # 'FlashAttention3_Triton': flash_attention_v3,
-    }
+    if df.empty:
+        print("❌ Version comparison failed")
+        return None, None
     
-    print("Performance-Focused FlashAttention Comparison")
-    print("Focus: Large sequences, bfloat16 precision")
-    print(f"Configurations: {len(config.sequence_lengths)} seq_lens × {len(config.head_dims)} head_dims")
-    print(f"Implementations: {list(implementations.keys())}")
-    print("=" * 60)
+    # Custom analysis for version comparison
+    print("\n" + "=" * 100)
+    print("🏆 FLASHATTENTION VERSION COMPARISON ANALYSIS")
+    print("=" * 100)
     
-    df = benchmarker.run_full_benchmark(implementations)
-    benchmarker.print_summary_table(df)
+    # Analyze each version at its optimal condition
+    print("\n📊 OPTIMAL PERFORMANCE ANALYSIS:")
+    print("-" * 60)
     
-    # Performance analysis
-    print("\n" + "=" * 80)
-    print("PERFORMANCE ANALYSIS")
-    print("=" * 80)
+    optimal_conditions = [
+        ("FA-1", 512, torch.float32, "FlashAttention1_Triton"),
+        ("FA-2", 2048, torch.bfloat16, "FlashAttention2_Triton"), 
+        ("FA-3", 8192, torch.bfloat16, "FlashAttention3_Triton")
+    ]
     
-    for seq_len in config.sequence_lengths:
-        seq_data = df[df['seq_len'] == seq_len]
-        if not seq_data.empty:
-            print(f"\nSequence Length {seq_len}:")
-            pytorch_time = seq_data[seq_data['implementation'] == 'PyTorch_Standard']['end_to_end_ms'].iloc[0]
+    for version, seq_len, dtype, impl_name in optimal_conditions:
+        dtype_str = str(dtype).split('.')[-1]
+        
+        # Get results for this optimal condition
+        condition_df = df[
+            (df['seq_len'] == seq_len) & 
+            (df['dtype'] == dtype_str) & 
+            (df['implementation'] == impl_name)
+        ]
+        
+        if not condition_df.empty:
+            result = condition_df.iloc[0]
+            pytorch_df = df[
+                (df['seq_len'] == seq_len) & 
+                (df['dtype'] == 'float32') &  # PyTorch baseline is always float32
+                (df['implementation'] == 'PyTorch_Standard')
+            ]
             
-            for impl in ['FlashAttention1_Triton', 'FlashAttention2_Triton', 'FlashAttention2_AllTriton']:
-                if impl in seq_data['implementation'].values:
-                    flash_time = seq_data[seq_data['implementation'] == impl]['end_to_end_ms'].iloc[0]
-                    if flash_time != float('inf') and pytorch_time != float('inf'):
-                        speedup = pytorch_time / flash_time
-                        print(f"  {impl}: {speedup:.2f}x speedup over PyTorch")
-                    else:
-                        print(f"  {impl}: FAILED or insufficient data")
+            if not pytorch_df.empty:
+                pytorch_time = pytorch_df.iloc[0]['end_to_end_ms']
+                speedup = pytorch_time / result['end_to_end_ms'] if result['end_to_end_ms'] != float('inf') else 0
+                
+                print(f"{version} (seq_len={seq_len}, {dtype_str}):")
+                print(f"  Forward: {result['forward_ms']:.2f}ms")
+                print(f"  Backward: {result['backward_ms']:.2f}ms") 
+                print(f"  End-to-End: {result['end_to_end_ms']:.2f}ms")
+                print(f"  Speedup vs PyTorch: {speedup:.2f}x")
+                print()
+        else:
+            print(f"{version}: FAILED or no data")
+            print()
     
+    benchmarker.print_optimized_summary(df)
+    return df, benchmarker
+
+
+def run_precision_analysis():
+    """Analyze the impact of different precisions on each FA version."""
+    print("FlashAttention Precision Analysis")
+    print("Testing impact of float32 vs bfloat16 on each version")
+    print("=" * 65)
+    
+    # Test all versions with both precisions
+    config = OptimizedBenchmarkConfig(
+        short_sequences=[512],                                # Representative for FA-1
+        medium_sequences=[2048],                              # Representative for FA-2
+        long_sequences=[8192],                                # Representative for FA-3
+        head_dims=[64],                                       # Focus on common head_dim
+        fa1_dtypes=[torch.float32, torch.bfloat16],          # Test both for FA-1
+        fa2_dtypes=[torch.float32, torch.bfloat16],          # Test both for FA-2
+        fa3_dtypes=[torch.float32, torch.bfloat16],          # Test both for FA-3
+        pytorch_dtypes=[torch.float32],
+        batch_size=1,
+        is_causal=True,
+        num_warmup=5,
+        num_iterations=15,
+        device='cuda'
+    )
+    
+    benchmarker = FlashAttentionBenchmarker(config)
+    df = benchmarker.run_optimized_benchmark()
+    
+    if df.empty:
+        print("❌ Precision analysis failed")
+        return None, None
+    
+    # Custom precision analysis
+    print("\n" + "=" * 100)
+    print("🔬 PRECISION IMPACT ANALYSIS")
+    print("=" * 100)
+    
+    versions = [
+        ("FA-1", 512, "FlashAttention1_Triton"),
+        ("FA-2", 2048, "FlashAttention2_Triton"),
+        ("FA-3", 8192, "FlashAttention3_Triton")
+    ]
+    
+    for version, seq_len, impl_name in versions:
+        print(f"\n{version} (seq_len={seq_len}):")
+        print("-" * 40)
+        
+        for dtype_str in ['float32', 'bfloat16']:
+            result_df = df[
+                (df['seq_len'] == seq_len) & 
+                (df['dtype'] == dtype_str) & 
+                (df['implementation'] == impl_name)
+            ]
+            
+            if not result_df.empty:
+                result = result_df.iloc[0]
+                print(f"  {dtype_str}: {result['end_to_end_ms']:.2f}ms "
+                      f"(speedup: {result['speedup_vs_pytorch']:.2f}x)")
+            else:
+                print(f"  {dtype_str}: FAILED or no data")
+    
+    benchmarker.print_optimized_summary(df)
     return df, benchmarker
 
 
 def main():
-    """Main benchmark runner with multiple options."""
+    """Main optimized benchmark runner with multiple options."""
     if not torch.cuda.is_available():
-        print("CUDA is not available. This benchmark requires a CUDA-enabled GPU.")
+        print("❌ CUDA is not available. This benchmark requires a CUDA-enabled GPU.")
         return
     
-    print("FlashAttention Comprehensive Benchmark Suite")
-    print("=" * 50)
-    print("1. Quick Benchmark (fast, limited configs)")
-    print("2. Comprehensive Benchmark (all versions, full configs)")
-    print("3. Performance Comparison (focus on speedup analysis)")
-    print("4. Custom Benchmark (user-specified configs)")
+    print("🎯 FlashAttention Optimized Benchmark Suite")
+    print("Focus: Each version tested in its optimal conditions")
+    print("=" * 60)
+    print("1. Quick Optimized Benchmark (fast, each version's strengths)")
+    print("2. Full Optimized Benchmark (comprehensive, all optimal conditions)")
+    print("3. Version Comparison (head-to-head at optimal settings)")
+    print("4. Precision Analysis (float32 vs bfloat16 impact)")
+    print("5. Custom Optimized Benchmark (user-specified configs)")
     print()
     
-    choice = input("Choose benchmark type (1-4): ").strip()
+    choice = input("Choose benchmark type (1-5): ").strip()
     
     try:
         if choice == "1":
-            print("\nRunning Quick Benchmark...")
-            df, benchmarker = run_quick_flashattention_benchmark()
+            print("\n🚀 Running Quick Optimized Benchmark...")
+            df, benchmarker = run_quick_optimized_benchmark()
         elif choice == "2":
-            print("\nRunning Comprehensive Benchmark...")
-            df, benchmarker = run_comprehensive_flashattention_benchmark()
+            print("\n🌟 Running Full Optimized Benchmark...")
+            df, benchmarker = run_flashattention_optimized_benchmark()
         elif choice == "3":
-            print("\nRunning Performance Comparison...")
-            df, benchmarker = run_performance_comparison()
+            print("\n🏆 Running Version Comparison...")
+            df, benchmarker = run_version_comparison()
         elif choice == "4":
-            print("\nRunning Custom Benchmark...")
-            df, benchmarker = run_custom_benchmark()
+            print("\n🔬 Running Precision Analysis...")
+            df, benchmarker = run_precision_analysis()
+        elif choice == "5":
+            print("\n⚙️ Running Custom Optimized Benchmark...")
+            df, benchmarker = run_custom_optimized_benchmark()
         else:
-            print("Invalid choice. Running Quick Benchmark by default.")
-            df, benchmarker = run_quick_flashattention_benchmark()
+            print("Invalid choice. Running Quick Optimized Benchmark by default.")
+            df, benchmarker = run_quick_optimized_benchmark()
     except Exception as e:
-        print(f"Benchmark failed with error: {e}")
+        print(f"❌ Benchmark failed with error: {e}")
         import traceback
         traceback.print_exc()
         return
     
-    print("\nBenchmark completed successfully!")
+    if df is None or df.empty:
+        print("❌ No benchmark results generated")
+        return
+    
+    print("\n✅ Benchmark completed successfully!")
     
     # Option to save detailed results
-    save = input("\nSave detailed results to CSV? (y/N): ").strip().lower()
+    save = input("\n💾 Save detailed results to CSV? (y/N): ").strip().lower()
     if save in ['y', 'yes']:
         import time
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        filename = f"flashattention_benchmark_{timestamp}.csv"
+        filename = f"flashattention_optimized_benchmark_{timestamp}.csv"
         benchmarker.save_results(df, filename)
     
-    # Option to show performance summary
-    summary = input("Show performance summary? (y/N): ").strip().lower()
-    if summary in ['y', 'yes']:
-        print("\n" + "=" * 80)
-        print("PERFORMANCE SUMMARY")
-        print("=" * 80)
+    # Option to show best configurations
+    best = input("📈 Show best configuration for each sequence length? (y/N): ").strip().lower()
+    if best in ['y', 'yes']:
+        print("\n" + "=" * 100)
+        print("🏆 BEST CONFIGURATION SUMMARY")
+        print("=" * 100)
         
-        # Show best performing implementation for each config
-        grouped = df.groupby(['seq_len', 'head_dim', 'dtype'])
-        for (seq_len, head_dim, dtype), group in grouped:
-            if len(group) > 1:
-                best = group.loc[group['end_to_end_ms'].idxmin()]
-                print(f"seq_len={seq_len}, head_dim={head_dim}, dtype={dtype}: "
-                      f"Best = {best['implementation']} ({best['end_to_end_ms']:.3f}ms)")
+        # Group by sequence length and find best implementation
+        unique_seq_lens = sorted(df['seq_len'].unique())
+        
+        for seq_len in unique_seq_lens:
+            seq_df = df[
+                (df['seq_len'] == seq_len) & 
+                (df['implementation'] != 'PyTorch_Standard') &
+                (df['end_to_end_ms'] != float('inf'))
+            ]
+            
+            if not seq_df.empty:
+                best_idx = seq_df['end_to_end_ms'].idxmin()
+                best_result = seq_df.loc[best_idx]
+                
+                speedup_str = f"{best_result['speedup_vs_pytorch']:.2f}x" if best_result['speedup_vs_pytorch'] else "N/A"
+                print(f"seq_len={seq_len}: {best_result['implementation']} "
+                      f"({best_result['dtype']}) - {best_result['end_to_end_ms']:.2f}ms ({speedup_str})")
 
 
 if __name__ == "__main__":

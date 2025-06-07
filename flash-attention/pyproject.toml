@@ -1,5 +1,5 @@
 [project]
-name = "cs336-systems"
+name = "My-FlashAttention"
 version = "1.0.4"
 description = "CS336 Assignment 2 - Systems"
 readme = "README.md"

@@ -250,16 +250,13 @@ if TRITON_AVAILABLE:
 
         # FA-3: Multi-stage pipeline buffers for async data movement
         # Note: True async would require hardware-level support
-        if NUM_STAGES >= 2:
-            # Pre-allocate pipeline buffers for K and V
-            k_buffer_0 = tl.zeros((K_TILE_SIZE, D), dtype=q.dtype)
-            v_buffer_0 = tl.zeros((K_TILE_SIZE, D), dtype=q.dtype)
-            if NUM_STAGES >= 3:
-                k_buffer_1 = tl.zeros((K_TILE_SIZE, D), dtype=q.dtype)
-                v_buffer_1 = tl.zeros((K_TILE_SIZE, D), dtype=q.dtype)
-            if NUM_STAGES >= 4:
-                k_buffer_2 = tl.zeros((K_TILE_SIZE, D), dtype=q.dtype)
-                v_buffer_2 = tl.zeros((K_TILE_SIZE, D), dtype=q.dtype)
+        # Initialize all possible buffers to avoid NameError
+        k_buffer_0 = tl.zeros((K_TILE_SIZE, D), dtype=q.dtype)
+        v_buffer_0 = tl.zeros((K_TILE_SIZE, D), dtype=q.dtype)
+        k_buffer_1 = tl.zeros((K_TILE_SIZE, D), dtype=q.dtype)
+        v_buffer_1 = tl.zeros((K_TILE_SIZE, D), dtype=q.dtype)
+        k_buffer_2 = tl.zeros((K_TILE_SIZE, D), dtype=q.dtype)
+        v_buffer_2 = tl.zeros((K_TILE_SIZE, D), dtype=q.dtype)
 
         # FA-3: Initialize accumulator buffers with enhanced precision
         acc = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
@@ -562,7 +559,7 @@ if TRITON_AVAILABLE:
             dV = torch.zeros_like(V)
     
             # Enhanced D computation with better numerical stability (FA-3 improvement)
-            with torch.cuda.amp.autocast(enabled=False):  # Use full precision for stability
+            with torch.amp.autocast('cuda', enabled=False):  # Use full precision for stability
                 D = torch.sum(grad_output.float() * O.float(), dim=-1).to(dtype)
 
             num_tiles = (seq_len + TILE_SIZE - 1) // TILE_SIZE
@@ -600,7 +597,7 @@ if TRITON_AVAILABLE:
                     Vj = V[:, k_start:k_end].contiguous()
             
                     # FA-3: Enhanced attention recomputation with mixed precision
-                    with torch.cuda.amp.autocast(enabled=True):
+                    with torch.amp.autocast('cuda', enabled=True):
                         # Use tensor cores for better performance
                         Sij = torch.einsum('bqd,bkd->bqk', Qi.to(torch.bfloat16), 
                                          Kj.to(torch.bfloat16)).to(dtype) * scale
@@ -616,7 +613,7 @@ if TRITON_AVAILABLE:
             
                     # FA-3: Enhanced softmax recomputation with numerical stability
                     # Use higher precision for attention weights
-                    with torch.cuda.amp.autocast(enabled=False):
+                    with torch.amp.autocast('cuda', enabled=False):
                         Pij = torch.exp((Sij.float() - Li.unsqueeze(-1).float())).to(dtype)
             
                     # FA-3: Memory-efficient gradient computation using fused operations
@@ -631,7 +628,7 @@ if TRITON_AVAILABLE:
                     dPij = torch.einsum('bqd,bkd->bqk', dOi, Vj)
             
                     # FA-3: Enhanced gradient computation with better numerical stability
-                    with torch.cuda.amp.autocast(enabled=False):
+                    with torch.amp.autocast('cuda', enabled=False):
                         # Use higher precision for stability-critical operations
                         dSij = (Pij.float() * (dPij.float() - Di.unsqueeze(-1).float())).to(dtype)
             
