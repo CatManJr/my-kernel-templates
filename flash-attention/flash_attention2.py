@@ -887,14 +887,78 @@ if TRITON_AVAILABLE:
         
         @staticmethod
         def backward(ctx, grad_output):
-            """GPU-accelerated backward pass using torch.compile and recomputation."""
+            """Efficient backward pass using the same PyTorch implementation with proper context."""
             Q, K, V, O, L = ctx.saved_tensors
             is_causal = ctx.is_causal
+            scale = ctx.scale
             
-            # Use the compiled GPU backward function
-            dQ, dK, dV = flash_backward_gpu(Q, K, V, O, grad_output, L, is_causal)
+            batch_size, seq_len, head_dim = Q.shape
+            device = Q.device
+            dtype = Q.dtype
+            
+            # Pre-allocate gradients
+            dQ = torch.zeros_like(Q)
+            dK = torch.zeros_like(K) 
+            dV = torch.zeros_like(V)
+            
+            # Efficient D computation
+            D = torch.sum(grad_output * O, dim=-1)
+            
+            # Use optimized tile size for backward
+            TILE_SIZE = min(64, seq_len)
+            TILE_SIZE = max(16, TILE_SIZE)
+            num_tiles = (seq_len + TILE_SIZE - 1) // TILE_SIZE
+            
+            # Optimized backward computation
+            for i in range(num_tiles):
+                q_start = i * TILE_SIZE
+                q_end = min(q_start + TILE_SIZE, seq_len)
+                
+                Qi = Q[:, q_start:q_end]
+                dOi = grad_output[:, q_start:q_end]
+                Li = L[:, q_start:q_end]
+                Di = D[:, q_start:q_end]
+                
+                dQi = torch.zeros_like(Qi)
+                
+                for j in range(num_tiles):
+                    k_start = j * TILE_SIZE
+                    k_end = min(k_start + TILE_SIZE, seq_len)
+                    
+                    Kj = K[:, k_start:k_end]
+                    Vj = V[:, k_start:k_end]
+                    
+                    # Recompute attention efficiently
+                    Sij = torch.einsum('bqd,bkd->bqk', Qi, Kj) * scale
+                    
+                    if is_causal:
+                        q_indices = torch.arange(q_start, q_end, device=device)[:, None]
+                        k_indices = torch.arange(k_start, k_end, device=device)[None, :]
+                        mask = q_indices < k_indices
+                        Sij.masked_fill_(mask, float('-inf'))
+                    
+                    Pij = torch.exp(Sij - Li.unsqueeze(-1))
+                    
+                    # Efficient gradient computation with einsum
+                    dVj = torch.einsum('bqk,bqd->bkd', Pij, dOi)
+                    dV[:, k_start:k_end] += dVj
+                    
+                    dPij = torch.einsum('bqd,bkd->bqk', dOi, Vj)
+                    dSij = Pij * (dPij - Di.unsqueeze(-1))
+                    
+                    if is_causal:
+                        dSij.masked_fill_(mask, 0.0)
+                    
+                    dQi += torch.einsum('bqk,bkd->bqd', dSij, Kj) * scale
+                    dKj = torch.einsum('bqk,bqd->bkd', dSij, Qi) * scale
+                    dK[:, k_start:k_end] += dKj
+            
+                dQ[:, q_start:q_end] = dQi
             
             return dQ, dK, dV, None
+
+    #triton kernel for backward pass
+
     
     class FlashAttentionTritonAll(torch.autograd.Function):
         """
@@ -907,9 +971,8 @@ if TRITON_AVAILABLE:
             device = Q.device
             dtype = Q.dtype
             
-            # important: nheads is hard coded to 1 for simplicity
-            # needs to be adjusted if multi-head attention is used
-            nheads = 1
+            # todo: make it dynamic
+            nheads = Q.shape[1] // K.shape[1]
             
             # Ensure contiguous tensors
             Q = Q.contiguous()
@@ -1040,32 +1103,12 @@ def flash_attention_pytorch(Q, K, V, is_causal=False):
 
 
 def flash_attention_triton(Q, K, V, is_causal=False):
-    """Triton FlashAttention-2 with proper dtype handling."""
+    """Triton FlashAttention-2 with optimized performance."""
     if not TRITON_AVAILABLE:
         raise RuntimeError("Triton is not available")
     
-    # Ensure input tensors are properly converted and contiguous
-    original_dtype = Q.dtype
-    
-    # Convert inputs to compatible dtype if needed
-    if Q.dtype == torch.bfloat16:
-        # Keep bfloat16 for computation efficiency
-        Q = Q.contiguous()
-        K = K.contiguous()
-        V = V.contiguous()
-    else:
-        # For other dtypes, ensure they're contiguous
-        Q = Q.contiguous()
-        K = K.contiguous()
-        V = V.contiguous()
-    
-    result = FlashAttentionTritonFunction.apply(Q, K, V, is_causal)
-    
-    # Ensure output has the same dtype as input
-    if result.dtype != original_dtype:
-        result = result.to(original_dtype)
-    
-    return result
+    # Direct function call without unnecessary overhead
+    return FlashAttentionTritonFunction.apply(Q, K, V, is_causal)
 
 
 def flash_attention_all_triton(Q, K, V, is_causal=False):
