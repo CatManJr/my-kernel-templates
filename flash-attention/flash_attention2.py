@@ -22,7 +22,9 @@ try:
 except ImportError:
     TRITON_AVAILABLE = False
 
-
+"""
+PyTorch implementation of FlashAttention-2
+"""
 @torch.compile
 def flash_backward_gpu(Q, K, V, O, dO, L, is_causal=False):
     """
@@ -261,6 +263,9 @@ class FlashAttentionPyTorchFunction(torch.autograd.Function):
         
         return dQ, dK, dV, None
 
+"""
+Triton kernels
+"""
 
 if TRITON_AVAILABLE:
     @triton.jit
@@ -386,152 +391,10 @@ if TRITON_AVAILABLE:
         tl.store(O_block_ptr, acc.to(O_block_ptr.type.element_ty), boundary_check=(0, 1))
         tl.store(L_block_ptr, l_final, boundary_check=(0,))
 
-    class FlashAttentionTritonFunction(torch.autograd.Function):
-        """Triton implementation of FlashAttention-2."""
-        
-        @staticmethod
-        def forward(ctx, Q, K, V, is_causal=False):
-            batch_size, seq_len, head_dim = Q.shape
-            device = Q.device
-            dtype = Q.dtype
-            
-            # Ensure contiguous tensors
-            Q = Q.contiguous()
-            K = K.contiguous()
-            V = V.contiguous()
-            
-            scale = 1.0 / math.sqrt(head_dim)
-            
-            # Optimized tile sizes
-            Q_TILE_SIZE = min(64, seq_len)
-            K_TILE_SIZE = min(64, seq_len)
-            Q_TILE_SIZE = max(16, Q_TILE_SIZE)
-            K_TILE_SIZE = max(16, K_TILE_SIZE)
-            
-            # Round to power of 2 for better performance
-            Q_TILE_SIZE = 1 << (Q_TILE_SIZE.bit_length() - 1)
-            K_TILE_SIZE = 1 << (K_TILE_SIZE.bit_length() - 1)
-            
-            # Initialize outputs
-            O = torch.empty_like(Q)
-            L = torch.empty(batch_size, seq_len, device=device, dtype=torch.float32)
-            
-            # Launch kernel
-            num_q_tiles = triton.cdiv(seq_len, Q_TILE_SIZE)
-            grid = (num_q_tiles, batch_size)
-            
-            flash_fwd_kernel[grid](
-                Q, K, V, O, L,
-                Q.stride(0), Q.stride(1), Q.stride(2),
-                K.stride(0), K.stride(1), K.stride(2),
-                V.stride(0), V.stride(1), V.stride(2),
-                O.stride(0), O.stride(1), O.stride(2),
-                L.stride(0), L.stride(1),
-                seq_len, seq_len, scale,
-                D=head_dim,
-                Q_TILE_SIZE=Q_TILE_SIZE,
-                K_TILE_SIZE=K_TILE_SIZE,
-                is_causal=is_causal,
-                num_warps=4,
-                num_stages=2,
-            )
-            
-            ctx.save_for_backward(Q, K, V, O, L)
-            ctx.is_causal = is_causal
-            ctx.scale = scale
-            
-            return O
-        
-        @staticmethod
-        def backward(ctx, grad_output):
-            """Efficient backward pass using the same PyTorch implementation with proper context."""
-            Q, K, V, O, L = ctx.saved_tensors
-            is_causal = ctx.is_causal
-            scale = ctx.scale
-            
-            batch_size, seq_len, head_dim = Q.shape
-            device = Q.device
-            dtype = Q.dtype
-            
-            # Pre-allocate gradients
-            dQ = torch.zeros_like(Q)
-            dK = torch.zeros_like(K) 
-            dV = torch.zeros_like(V)
-            
-            # Efficient D computation
-            D = torch.sum(grad_output * O, dim=-1)
-            
-            # Use optimized tile size for backward
-            TILE_SIZE = min(64, seq_len)
-            TILE_SIZE = max(16, TILE_SIZE)
-            num_tiles = (seq_len + TILE_SIZE - 1) // TILE_SIZE
-            
-            # Optimized backward computation
-            for i in range(num_tiles):
-                q_start = i * TILE_SIZE
-                q_end = min(q_start + TILE_SIZE, seq_len)
-                
-                Qi = Q[:, q_start:q_end]
-                dOi = grad_output[:, q_start:q_end]
-                Li = L[:, q_start:q_end]
-                Di = D[:, q_start:q_end]
-                
-                dQi = torch.zeros_like(Qi)
-                
-                for j in range(num_tiles):
-                    k_start = j * TILE_SIZE
-                    k_end = min(k_start + TILE_SIZE, seq_len)
-                    
-                    Kj = K[:, k_start:k_end]
-                    Vj = V[:, k_start:k_end]
-                    
-                    # Recompute attention efficiently
-                    Sij = torch.einsum('bqd,bkd->bqk', Qi, Kj) * scale
-                    
-                    if is_causal:
-                        q_indices = torch.arange(q_start, q_end, device=device)[:, None]
-                        k_indices = torch.arange(k_start, k_end, device=device)[None, :]
-                        mask = q_indices < k_indices
-                        Sij.masked_fill_(mask, float('-inf'))
-                    
-                    Pij = torch.exp(Sij - Li.unsqueeze(-1))
-                    
-                    # Efficient gradient computation with einsum
-                    dVj = torch.einsum('bqk,bqd->bkd', Pij, dOi)
-                    dV[:, k_start:k_end] += dVj
-                    
-                    dPij = torch.einsum('bqd,bkd->bqk', dOi, Vj)
-                    dSij = Pij * (dPij - Di.unsqueeze(-1))
-                    
-                    if is_causal:
-                        dSij.masked_fill_(mask, 0.0)
-                    
-                    dQi += torch.einsum('bqk,bkd->bqd', dSij, Kj) * scale
-                    dKj = torch.einsum('bqk,bqd->bkd', dSij, Qi) * scale
-                    dK[:, k_start:k_end] += dKj
-            
-                dQ[:, q_start:q_end] = dQi
-            
-            return dQ, dK, dV, None
-
-    #triton kernel for backward pass
     @triton.jit
     def _bwd_preprocess_do_o_dot(
-        Out,
-        DO,
-        Delta,
-        stride_ob,
-        stride_oh,
-        stride_om,
-        stride_dob,
-        stride_doh,
-        stride_dom,
-        nheads,
-        seqlen_q,
-        seqlen_q_rounded,
-        headdim,
-        BLOCK_M: tl.constexpr,
-        BLOCK_HEADDIM: tl.constexpr,
+        Out, DO, Delta, stride_ob, stride_oh, stride_om, stride_dob, stride_doh, stride_dom,
+        nheads, seqlen_q, seqlen_q_rounded, headdim, BLOCK_M: tl.constexpr, BLOCK_HEADDIM: tl.constexpr,
     ):
         start_m = tl.program_id(0)
         off_hb = tl.program_id(1)
@@ -562,14 +425,9 @@ if TRITON_AVAILABLE:
 
     @triton.jit
     def _bwd_store_dk_dv(
-        dk_ptrs,
-        dv_ptrs,
-        dk,
-        dv,
-        offs_n,
-        offs_d,
-        seqlen_k,
-        headdim,
+        dk_ptrs, dv_ptrs, dk, dv,
+        offs_n, offs_d,
+        seqlen_k, headdim,
         EVEN_M: tl.constexpr,
         EVEN_N: tl.constexpr,
         EVEN_HEADDIM: tl.constexpr,
@@ -594,38 +452,11 @@ if TRITON_AVAILABLE:
     # copied from flash_attn_triton.py - Dao AILab
     @triton.jit
     def _bwd_kernel_one_col_block(
-        start_n,
-        Q,
-        K,
-        V,
-        Bias,
-        DO,
-        DQ,
-        DK,
-        DV,
-        LSE,
-        D,
-        softmax_scale,
-        stride_qm,
-        stride_kn,
-        stride_vn,
-        stride_bm,
-        stride_dom,
-        stride_dqm,
-        stride_dkn,
-        stride_dvn,
-        seqlen_q,
-        seqlen_k,
-        headdim,
-        ATOMIC_ADD: tl.constexpr,
-        BIAS_TYPE: tl.constexpr,
-        IS_CAUSAL: tl.constexpr,
-        BLOCK_HEADDIM: tl.constexpr,
-        EVEN_M: tl.constexpr,
-        EVEN_N: tl.constexpr,
-        EVEN_HEADDIM: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
+        start_n, Q, K, V, Bias, DO, DQ, DK, DV, LSE, D, softmax_scale,
+        stride_qm, stride_kn, stride_vn, stride_bm, stride_dom, stride_dqm, stride_dkn, stride_dvn,
+        seqlen_q, seqlen_k, headdim, ATOMIC_ADD: tl.constexpr, BIAS_TYPE: tl.constexpr,
+        IS_CAUSAL: tl.constexpr, BLOCK_HEADDIM: tl.constexpr, EVEN_M: tl.constexpr,
+        EVEN_N: tl.constexpr, EVEN_HEADDIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     ):
         # We need to make sure begin_m is a multiple of BLOCK_M (not BLOCK_N)
         begin_m = 0 if not IS_CAUSAL else ((start_n * BLOCK_N) // BLOCK_M) * BLOCK_M
@@ -655,17 +486,9 @@ if TRITON_AVAILABLE:
             dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
             dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
             _bwd_store_dk_dv(
-                dk_ptrs,
-                dv_ptrs,
-                dk,
-                dv,
-                offs_n,
-                offs_d,
-                seqlen_k,
-                headdim,
-                EVEN_M=EVEN_M,
-                EVEN_N=EVEN_N,
-                EVEN_HEADDIM=EVEN_HEADDIM,
+                dk_ptrs, dv_ptrs, dk, dv,
+                offs_n, offs_d, seqlen_k, headdim,
+                EVEN_M=EVEN_M, EVEN_N=EVEN_N, EVEN_HEADDIM=EVEN_HEADDIM,
             )
             return
         # k and v stay in SRAM throughout
@@ -708,7 +531,7 @@ if TRITON_AVAILABLE:
                         other=0.0,
                     )
             # recompute p = softmax(qk, dim=-1).T
-            # 修复：使用tl.trans()替代trans_b=True
+            # Fix：use tl.trans() instead of trans_b=True
             qk = tl.dot(q, tl.trans(k))
             # Trying to combine the two masks seem to make the result wrong
             if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
@@ -767,7 +590,7 @@ if TRITON_AVAILABLE:
             #     else:
             #         do = tl.load(do_ptrs, mask=(offs_m_curr[:, None] < seqlen_q)
             #                                    & (offs_d[None, :] < headdim), other=0.0)
-            # 修复：使用tl.trans()替代trans_a=True
+            # Fix: use tl.trans() instead of trans_a=True
             dv += tl.dot(tl.trans(p.to(do.dtype)), do)
             # compute dp = dot(v, do)
             # There seems to be a race condition when headdim=48/96, and dq, dk are wrong.
@@ -775,7 +598,7 @@ if TRITON_AVAILABLE:
             # Also wrong for headdim=64, seqlen=(1023, 1024), and ATOMIC_ADD=False
             if not (EVEN_M & EVEN_HEADDIM):
                 tl.debug_barrier()
-            # 修复：使用tl.trans()替代trans_b=True
+            # Fix: use tl.trans() instead of trans_b=True
             dp = tl.dot(do, tl.trans(v))
             # There's a race condition for headdim=48
             if not EVEN_HEADDIM:
@@ -787,7 +610,7 @@ if TRITON_AVAILABLE:
             # for BLOCK_HEADDIM=128
             ds = (p * (dp - Di[:, None]) * softmax_scale).to(q.dtype)
             # compute dk = dot(ds.T, q)
-            # 修复：使用tl.trans()替代trans_a=True
+            # Fix: use tl.trans() instead of trans_a=True
             dk += tl.dot(tl.trans(ds), q)
             # compute dq
             if not (
@@ -851,19 +674,9 @@ if TRITON_AVAILABLE:
         dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
         dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
         _bwd_store_dk_dv(
-            dk_ptrs,
-            dv_ptrs,
-            dk,
-            dv,
-            offs_n,
-            offs_d,
-            seqlen_k,
-            headdim,
-            EVEN_M=EVEN_M,
-            EVEN_N=EVEN_N,
-            EVEN_HEADDIM=EVEN_HEADDIM,
+            dk_ptrs, dv_ptrs, dk, dv, offs_n, offs_d, seqlen_k, headdim,
+            EVEN_M=EVEN_M, EVEN_N=EVEN_N, EVEN_HEADDIM=EVEN_HEADDIM,
         )
-
 
     def init_to_zero(name):
         return lambda nargs: nargs[name].zero_()
@@ -909,57 +722,17 @@ if TRITON_AVAILABLE:
     
     @triton.jit
     def _bwd_kernel(
-        Q,
-        K,
-        V,
-        Bias,
-        DO,
-        DQ,
-        DK,
-        DV,
-        LSE,
-        D,
-        softmax_scale,
-        stride_qb,
-        stride_qh,
-        stride_qm,
-        stride_kb,
-        stride_kh,
-        stride_kn,
-        stride_vb,
-        stride_vh,
-        stride_vn,
-        stride_bb,
-        stride_bh,
-        stride_bm,
-        stride_dob,
-        stride_doh,
-        stride_dom,
-        stride_dqb,
-        stride_dqh,
-        stride_dqm,
-        stride_dkb,
-        stride_dkh,
-        stride_dkn,
-        stride_dvb,
-        stride_dvh,
-        stride_dvn,
-        nheads,
-        seqlen_q,
-        seqlen_k,
-        seqlen_q_rounded,
-        headdim,
-        CACHE_KEY_SEQLEN_Q,
-        CACHE_KEY_SEQLEN_K,
-        BIAS_TYPE: tl.constexpr,
-        IS_CAUSAL: tl.constexpr,
-        BLOCK_HEADDIM: tl.constexpr,
-        SEQUENCE_PARALLEL: tl.constexpr,
-        EVEN_M: tl.constexpr,
-        EVEN_N: tl.constexpr,
-        EVEN_HEADDIM: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
+        Q, K, V, Bias, DO, DQ, DK, DV, LSE, D, softmax_scale,
+        stride_qb, stride_qh, stride_qm, stride_kb, stride_kh, stride_kn,
+        stride_vb, stride_vh, stride_vn, stride_bb, stride_bh, stride_bm,
+        stride_dob, stride_doh, stride_dom, stride_dqb, stride_dqh, stride_dqm,
+        stride_dkb, stride_dkh, stride_dkn, stride_dvb, stride_dvh, stride_dvn,
+        nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim,
+        CACHE_KEY_SEQLEN_Q, CACHE_KEY_SEQLEN_K,
+        BIAS_TYPE: tl.constexpr, IS_CAUSAL: tl.constexpr, 
+        BLOCK_HEADDIM: tl.constexpr, SEQUENCE_PARALLEL: tl.constexpr,
+        EVEN_M: tl.constexpr, EVEN_N: tl.constexpr, EVEN_HEADDIM: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     ):
         off_hb = tl.program_id(1)
         off_b = off_hb // nheads
@@ -981,74 +754,23 @@ if TRITON_AVAILABLE:
             num_block_n = tl.cdiv(seqlen_k, BLOCK_N)
             for start_n in range(0, num_block_n):
                 _bwd_kernel_one_col_block(
-                    start_n,
-                    Q,
-                    K,
-                    V,
-                    Bias,
-                    DO,
-                    DQ,
-                    DK,
-                    DV,
-                    LSE,
-                    D,
-                    softmax_scale,
-                    stride_qm,
-                    stride_kn,
-                    stride_vn,
-                    stride_bm,
-                    stride_dom,
-                    stride_dqm,
-                    stride_dkn,
-                    stride_dvn,
-                    seqlen_q,
-                    seqlen_k,
-                    headdim,
-                    ATOMIC_ADD=False,
-                    BIAS_TYPE=BIAS_TYPE,
-                    IS_CAUSAL=IS_CAUSAL,
-                    BLOCK_HEADDIM=BLOCK_HEADDIM,
-                    EVEN_M=EVEN_M,
-                    EVEN_N=EVEN_N,
-                    EVEN_HEADDIM=EVEN_HEADDIM,
-                    BLOCK_M=BLOCK_M,
-                    BLOCK_N=BLOCK_N,
+                    start_n, Q, K, V, Bias, DO, DQ, DK, DV, LSE, D, softmax_scale,
+                    stride_qm, stride_kn, stride_vn, stride_bm, stride_dom, stride_dqm, 
+                    stride_dkn, stride_dvn, seqlen_q, seqlen_k, headdim, ATOMIC_ADD=False,
+                    BIAS_TYPE=BIAS_TYPE, IS_CAUSAL=IS_CAUSAL, BLOCK_HEADDIM=BLOCK_HEADDIM,
+                    EVEN_M=EVEN_M, EVEN_N=EVEN_N, EVEN_HEADDIM=EVEN_HEADDIM,
+                    BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
                 )
         else:
             start_n = tl.program_id(0)
             _bwd_kernel_one_col_block(
-                start_n,
-                Q,
-                K,
-                V,
-                Bias,
-                DO,
-                DQ,
-                DK,
-                DV,
-                LSE,
-                D,
-                softmax_scale,
-                stride_qm,
-                stride_kn,
-                stride_vn,
-                stride_bm,
-                stride_dom,
-                stride_dqm,
-                stride_dkn,
-                stride_dvn,
-                seqlen_q,
-                seqlen_k,
-                headdim,
-                ATOMIC_ADD=True,
-                BIAS_TYPE=BIAS_TYPE,
-                IS_CAUSAL=IS_CAUSAL,
-                BLOCK_HEADDIM=BLOCK_HEADDIM,
-                EVEN_M=EVEN_M,
-                EVEN_N=EVEN_N,
-                EVEN_HEADDIM=EVEN_HEADDIM,
-                BLOCK_M=BLOCK_M,
-                BLOCK_N=BLOCK_N,
+                start_n, Q, K, V, Bias, DO, DQ, DK, DV, LSE, D,
+                softmax_scale, stride_qm, stride_kn, stride_vn, stride_bm,
+                stride_dom, stride_dqm, stride_dkn, stride_dvn,
+                seqlen_q, seqlen_k, headdim,
+                ATOMIC_ADD=True, BIAS_TYPE=BIAS_TYPE, IS_CAUSAL=IS_CAUSAL,
+                BLOCK_HEADDIM=BLOCK_HEADDIM, EVEN_M=EVEN_M, EVEN_N=EVEN_N,
+                EVEN_HEADDIM=EVEN_HEADDIM, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
             )
             
     def _flash_attn_backward(
@@ -1073,23 +795,9 @@ if TRITON_AVAILABLE:
 
         BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
         grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads)
-        _bwd_preprocess_do_o_dot[grid](
-            o,
-            do,
-            delta,
-            o.stride(0),
-            o.stride(2),
-            o.stride(1),
-            do.stride(0),
-            do.stride(2),
-            do.stride(1),
-            nheads,
-            seqlen_q,
-            seqlen_q_rounded,
-            d,
-            BLOCK_M=128,
-            BLOCK_HEADDIM=BLOCK_HEADDIM,
-        )
+        _bwd_preprocess_do_o_dot[grid](o, do, delta, o.stride(0), o.stride(2), o.stride(1), 
+                                       do.stride(0), do.stride(2), do.stride(1), nheads, 
+                                       seqlen_q, seqlen_q_rounded, d, BLOCK_M=128, BLOCK_HEADDIM=BLOCK_HEADDIM)
 
         has_bias = bias is not None
         bias_type = "none"
@@ -1117,62 +825,91 @@ if TRITON_AVAILABLE:
             batch * nheads,
         )
         _bwd_kernel[grid](
-            q,
-            k,
-            v,
-            bias,
-            do,
-            dq_accum,
-            dk,
-            dv,
-            lse,
-            delta,
-            softmax_scale,
-            q.stride(0),
-            q.stride(2),
-            q.stride(1),
-            k.stride(0),
-            k.stride(2),
-            k.stride(1),
-            v.stride(0),
-            v.stride(2),
-            v.stride(1),
+            q, k, v, bias, do, dq_accum, dk, dv, lse, delta, softmax_scale,
+            q.stride(0), q.stride(2), q.stride(1),
+            k.stride(0), k.stride(2), k.stride(1),
+            v.stride(0), v.stride(2), v.stride(1),
             *bias_strides,
-            do.stride(0),
-            do.stride(2),
-            do.stride(1),
-            dq_accum.stride(0),
-            dq_accum.stride(2),
-            dq_accum.stride(1),
-            dk.stride(0),
-            dk.stride(2),
-            dk.stride(1),
-            dv.stride(0),
-            dv.stride(2),
-            dv.stride(1),
-            nheads,
-            seqlen_q,
-            seqlen_k,
-            seqlen_q_rounded,
-            d,
-            seqlen_q // 32,
-            seqlen_k // 32,  # key for triton cache (limit number of compilations)
-            # Can't use kwargs here because triton autotune expects key to be args, not kwargs
-            # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
-            bias_type,
-            causal,
-            BLOCK_HEADDIM,
-            # SEQUENCE_PARALLEL=False,
-            # BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-            # num_warps=num_warps,
-            # num_stages=1,
+            do.stride(0), do.stride(2), do.stride(1),
+            dq_accum.stride(0), dq_accum.stride(2), dq_accum.stride(1),
+            dk.stride(0), dk.stride(2), dk.stride(1),
+            dv.stride(0), dv.stride(2), dv.stride(1),
+            nheads, seqlen_q, seqlen_k, seqlen_q_rounded, d,
+            seqlen_q // 32, seqlen_k // 32,
+            bias_type, causal, BLOCK_HEADDIM,
         )
         dq.copy_(dq_accum)
     
+    class FlashAttentionTritonFunction(torch.autograd.Function):
+        """Triton forward + Torch backward version of FlashAttention-2."""
+        
+        @staticmethod
+        def forward(ctx, Q, K, V, is_causal=False):
+            batch_size, seq_len, head_dim = Q.shape
+            device = Q.device
+            dtype = Q.dtype
+            
+            # Ensure contiguous tensors
+            Q = Q.contiguous()
+            K = K.contiguous()
+            V = V.contiguous()
+            
+            scale = 1.0 / math.sqrt(head_dim)
+            
+            # Optimized tile sizes
+            Q_TILE_SIZE = min(64, seq_len)
+            K_TILE_SIZE = min(64, seq_len)
+            Q_TILE_SIZE = max(16, Q_TILE_SIZE)
+            K_TILE_SIZE = max(16, K_TILE_SIZE)
+            
+            # Round to power of 2 for better performance
+            Q_TILE_SIZE = 1 << (Q_TILE_SIZE.bit_length() - 1)
+            K_TILE_SIZE = 1 << (K_TILE_SIZE.bit_length() - 1)
+            
+            # Initialize outputs
+            O = torch.empty_like(Q)
+            L = torch.empty(batch_size, seq_len, device=device, dtype=torch.float32)
+            
+            # Launch kernel
+            num_q_tiles = triton.cdiv(seq_len, Q_TILE_SIZE)
+            grid = (num_q_tiles, batch_size)
+            
+            flash_fwd_kernel[grid](
+                Q, K, V, O, L,
+                Q.stride(0), Q.stride(1), Q.stride(2),
+                K.stride(0), K.stride(1), K.stride(2),
+                V.stride(0), V.stride(1), V.stride(2),
+                O.stride(0), O.stride(1), O.stride(2),
+                L.stride(0), L.stride(1),
+                seq_len, seq_len, scale,
+                D=head_dim,
+                Q_TILE_SIZE=Q_TILE_SIZE,
+                K_TILE_SIZE=K_TILE_SIZE,
+                is_causal=is_causal,
+                num_warps=4,
+                num_stages=2,
+            )
+            
+            ctx.save_for_backward(Q, K, V, O, L)
+            ctx.is_causal = is_causal
+            ctx.scale = scale
+            
+            return O
+        
+        @staticmethod
+        def backward(ctx, grad_output):
+            """GPU-accelerated backward pass using torch.compile and recomputation."""
+            Q, K, V, O, L = ctx.saved_tensors
+            is_causal = ctx.is_causal
+            
+            # Use the compiled GPU backward function
+            dQ, dK, dV = flash_backward_gpu(Q, K, V, O, grad_output, L, is_causal)
+            
+            return dQ, dK, dV, None
+    
     class FlashAttentionTritonAll(torch.autograd.Function):
         """
-        Enhanced Triton implementation of FlashAttention-2 with optimized backward pass.
-        This version uses Triton kernels for both forward and backward passes with online softmax.
+        Triton forward + Torch backward version of FlashAttention-2
         """
         
         @staticmethod
@@ -1181,7 +918,8 @@ if TRITON_AVAILABLE:
             device = Q.device
             dtype = Q.dtype
             
-            # 重要：假设单头，如果是多头需要调整
+            # important: nheads is hard coded to 1 for simplicity
+            # needs to be adjusted if multi-head attention is used
             nheads = 1
             
             # Ensure contiguous tensors
@@ -1204,7 +942,7 @@ if TRITON_AVAILABLE:
             # Initialize outputs
             O = torch.empty_like(Q)
             
-            # 临时L用于forward kernel（保持原始形状）
+            # Temporary L for forward kernel (maintaining original shape)
             L_temp = torch.empty(batch_size, seq_len, device=device, dtype=torch.float32)
             
             # Launch kernel
@@ -1227,22 +965,22 @@ if TRITON_AVAILABLE:
                 num_stages=2,
             )
             
-            # 关键修复：L需要与Dao-AILab格式匹配 (batch, nheads, seqlen_q_rounded)
+            # Key fix: L needs to match Dao-AILab format (batch, nheads, seqlen_q_rounded)
             seqlen_q_rounded = math.ceil(seq_len / 128) * 128
             L = torch.empty(batch_size, nheads, seqlen_q_rounded, device=device, dtype=torch.float32)
             
-            # 复制L_temp到正确的L形状，注意stride布局
+            # Copy L_temp to correct L shape, note stride layout
             L[:, 0, :seq_len] = L_temp
             if seq_len < seqlen_q_rounded:
-                L[:, 0, seq_len:] = float('-inf')  # 填充无效位置
+                L[:, 0, seq_len:] = float('-inf')  # fill remaining with -inf
             
-            # 重新整理tensors以匹配Dao-AILab的形状期望 (batch, seqlen, nheads, head_dim)
+            # Reshape tensors to match Dao-AILab's expected shape (batch, seqlen, nheads, head_dim)
             Q_reshaped = Q.unsqueeze(2)  # (batch, seq_len, 1, head_dim)
             K_reshaped = K.unsqueeze(2)  # (batch, seq_len, 1, head_dim) 
             V_reshaped = V.unsqueeze(2)  # (batch, seq_len, 1, head_dim)
             O_reshaped = O.unsqueeze(2)  # (batch, seq_len, 1, head_dim)
             
-            # 保存6个tensors以匹配backward期望：q, k, v, o, lse, bias
+            # Save 6 tensors to match backward expectations: q, k, v, o, lse, bias
             ctx.save_for_backward(Q_reshaped, K_reshaped, V_reshaped, O_reshaped, L, None)  # bias=None
             ctx.is_causal = is_causal
             ctx.scale = scale
@@ -1259,11 +997,11 @@ if TRITON_AVAILABLE:
             nheads = ctx.nheads
             seqlen_q_rounded = ctx.seqlen_q_rounded
             
-            # 确保do是contiguous的
+            # Ensure do is contiguous
             if do.stride(-1) != 1:
                 do = do.contiguous()
             
-            # 重新整理do的形状以匹配保存的tensors (batch, seqlen, nheads, head_dim)
+            # Reshape do to match saved tensors format (batch, seqlen, nheads, head_dim)
             do_reshaped = do.unsqueeze(2)  # (batch, seq_len, 1, head_dim)
             
             # Triton's autotune causes the Tensor._version to change, and so Pytorch autograd
@@ -1274,21 +1012,11 @@ if TRITON_AVAILABLE:
                 dv = torch.empty_like(v)
                 
                 _flash_attn_backward(
-                    do_reshaped,
-                    q,
-                    k,
-                    v,
-                    o,
-                    lse,
-                    dq,
-                    dk,
-                    dv,
-                    bias=bias,
-                    causal=is_causal,
-                    softmax_scale=scale,
+                    do_reshaped, q, k, v, o, lse, dq, dk, dv, 
+                    bias=bias, causal=is_causal, softmax_scale=scale,
                 )
             
-            # 移除添加的head维度以匹配原始输入形状 (batch, seq_len, head_dim)
+            # Squeeze the extra dimension added for nheads
             dq_squeezed = dq.squeeze(2)  # (batch, seq_len, head_dim)
             dk_squeezed = dk.squeeze(2)  # (batch, seq_len, head_dim)
             dv_squeezed = dv.squeeze(2)  # (batch, seq_len, head_dim)
@@ -1304,7 +1032,9 @@ else:
         def backward(ctx, grad_output):
             raise NotImplementedError()
 
-
+"""
+export API
+"""
 def flash_attention_pytorch(Q, K, V, is_causal=False):
     """Optimized PyTorch FlashAttention-2."""
     return FlashAttentionPyTorchFunction.apply(Q, K, V, is_causal)
