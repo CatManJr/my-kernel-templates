@@ -1,4 +1,4 @@
-# my-triton-templates :floppy_disk:
+# My-Kernel-Templates :floppy_disk:
 This repo contains some typical triton kernel I wrote or used. I will regularly review and modify them to make my future kernel developing more easier.
 ## Update Memo :calling:
 ### Update June 6, 2025: from triton puzzles :gift_heart:
@@ -8,7 +8,7 @@ Lately, I walked through the fabulous work [![triton-puzzles](https://badgen.net
 Inspired by [CS336 in Stanford](https://stanford-cs336.github.io/spring2025/), I reproduced the Flash Attention in this repo too. The course required a FlashAttention 2, but I also implemented version 1 and 3.
 They are implemented with a Triton forward kernel and a torch backward function. For FlashAttention-2, I also implemented full pytorch version and full Triton verison (backward kernel adopted from Dao AILab) [![Dao AILab](https://badgen.net/badge/Dao-AILab/flash-attention/blue?icon=github)](https://github.com/Dao-AILab/flash-attention)
 #### Different Implementations of Flash Attention 2
-
+- All the benchmarks were executed on a `A100-PCIE-40GB`
 - My FA-2 and FA-2 FULL share the same forward kernel implementation, but FA-2 FULL incorporates a Triton backward kernel for enhanced performance.
 > **Key Insight**: The results demonstrate the significant performance benefits of implementing custom Triton kernels for both custom forward & backward. However, the triton backward kernel performance still lags behind PyTorch existing implementations, highlighting the continued importance of CUDA for fine-grained GPU operations.💡 
 #### Forward Performance vs PyTorch
