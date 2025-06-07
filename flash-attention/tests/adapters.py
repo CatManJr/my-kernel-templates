@@ -8,6 +8,7 @@ import torch
 from flash_attention2 import (
     FlashAttentionPyTorchFunction, 
     FlashAttentionTritonFunction,
+    FlashAttentionTritonAll,
     TRITON_AVAILABLE
 )
 
@@ -49,6 +50,16 @@ def get_flashattention_autograd_function_triton() -> Type:
         A class object (not an instance of the class)
     """
     return FlashAttentionTritonFunction
+
+def get_flashattention_autograd_function_triton_all() -> Type:
+    """
+    Returns a torch.autograd.Function subclass that implements FlashAttention-2
+    using Triton kernels for both fwd & bwd.
+
+    Returns:
+        A class object (not an instance of the class)
+    """
+    return FlashAttentionTritonAll
 
 
 def get_flashattention_v1_autograd_function() -> Type:

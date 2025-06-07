@@ -510,19 +510,19 @@ if TRITON_AVAILABLE:
             return dQ, dK, dV, None
 
     @triton.jit
-    def flash_bwd_kernel(
-        Q_ptr, K_ptr, V_ptr, O_ptr, dO_ptr, L_ptr,
-        dQ_ptr, dK_ptr, dV_ptr, D_ptr,
+    def flash_bwd_kernel_v2(
+        Q_ptr, K_ptr, V_ptr, O_ptr, dO_ptr, L_ptr, D_ptr,
+        dQ_ptr, dK_ptr, dV_ptr,
         stride_qb, stride_qq, stride_qd,
         stride_kb, stride_kk, stride_kd,
         stride_vb, stride_vk, stride_vd,
         stride_ob, stride_oq, stride_od,
         stride_dob, stride_doq, stride_dod,
         stride_lb, stride_lq,
+        stride_db, stride_dq_idx,
         stride_dqb, stride_dqq, stride_dqd,
         stride_dkb, stride_dkk, stride_dkd,
         stride_dvb, stride_dvk, stride_dvd,
-        stride_db, stride_dq_idx,
         N_QUERIES, N_KEYS,
         scale,
         D: tl.constexpr,
@@ -531,184 +531,187 @@ if TRITON_AVAILABLE:
         is_causal: tl.constexpr,
     ):
         """
-        Triton kernel for FlashAttention-2 backward pass with online softmax.
-        Implements the recomputation strategy from the FlashAttention paper.
+        Algorithm 2: Tiled FlashAttention-2 backward pass
+        
+        Key insight: Compute P twice to avoid synchronization:
+        - Once for dQ computation 
+        - Once for dK and dV computation
+        
+        This implementation follows the exact algorithm structure where:
+        1. Outer loop over K/V tiles (j)
+        2. Inner loop over Q tiles (i) 
+        3. Atomic updates for dQ accumulation
         """
-        # Program indices
-        query_tile_index = tl.program_id(0)
-        batch_index = tl.program_id(1)
+        # This kernel processes one K/V tile (j-th tile)
+        k_tile_id = tl.program_id(0)  # j in algorithm
+        batch_id = tl.program_id(1)
         
-        # Query tile setup
-        q_start = query_tile_index * Q_TILE_SIZE
-        q_end = tl.minimum(q_start + Q_TILE_SIZE, N_QUERIES)
+        # Calculate K/V tile boundaries
+        k_start = k_tile_id * K_TILE_SIZE
+        k_end = tl.minimum(k_start + K_TILE_SIZE, N_KEYS)
         
-        # Block pointers for query tile
-        Q_block_ptr = tl.make_block_ptr(
-            Q_ptr + batch_index * stride_qb,
-            shape=(N_QUERIES, D),
-            strides=(stride_qq, stride_qd),
-            offsets=(q_start, 0),
-            block_shape=(Q_TILE_SIZE, D),
+        # Load K(j) and V(j) tiles - done once per kernel
+        K_block_ptr = tl.make_block_ptr(
+            K_ptr + batch_id * stride_kb,
+            shape=(N_KEYS, D),
+            strides=(stride_kk, stride_kd),
+            offsets=(k_start, 0),
+            block_shape=(K_TILE_SIZE, D),
             order=(1, 0),
         )
         
-        dO_block_ptr = tl.make_block_ptr(
-            dO_ptr + batch_index * stride_dob,
-            shape=(N_QUERIES, D),
-            strides=(stride_doq, stride_dod),
-            offsets=(q_start, 0),
-            block_shape=(Q_TILE_SIZE, D),
+        V_block_ptr = tl.make_block_ptr(
+            V_ptr + batch_id * stride_vb,
+            shape=(N_KEYS, D),
+            strides=(stride_vk, stride_vd),
+            offsets=(k_start, 0),
+            block_shape=(K_TILE_SIZE, D),
             order=(1, 0),
         )
         
-        O_block_ptr = tl.make_block_ptr(
-            O_ptr + batch_index * stride_ob,
-            shape=(N_QUERIES, D),
-            strides=(stride_oq, stride_od),
-            offsets=(q_start, 0),
-            block_shape=(Q_TILE_SIZE, D),
-            order=(1, 0),
-        )
+        # Load K(j) and V(j) from global memory
+        k_j = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        v_j = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
         
-        L_block_ptr = tl.make_block_ptr(
-            L_ptr + batch_index * stride_lb,
-            shape=(N_QUERIES,),
-            strides=(stride_lq,),
-            offsets=(q_start,),
-            block_shape=(Q_TILE_SIZE,),
-            order=(0,),
-        )
+        # Initialize dK(j) = dV(j) = 0
+        dk_j = tl.zeros((K_TILE_SIZE, D), dtype=tl.float32)
+        dv_j = tl.zeros((K_TILE_SIZE, D), dtype=tl.float32)
         
-        D_block_ptr = tl.make_block_ptr(
-            D_ptr + batch_index * stride_db,
-            shape=(N_QUERIES,),
-            strides=(stride_dq_idx,),
-            offsets=(q_start,),
-            block_shape=(Q_TILE_SIZE,),
-            order=(0,),
-        )
+        # Inner loop over Q tiles (i = 1, ..., Tq)
+        num_q_tiles = tl.cdiv(N_QUERIES, Q_TILE_SIZE)
         
-        dQ_block_ptr = tl.make_block_ptr(
-            dQ_ptr + batch_index * stride_dqb,
-            shape=(N_QUERIES, D),
-            strides=(stride_dqq, stride_dqd),
-            offsets=(q_start, 0),
-            block_shape=(Q_TILE_SIZE, D),
-            order=(1, 0),
-        )
-        
-        # Load query tile data
-        q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        do = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        o = tl.load(O_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        L_i = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")
-        D_i = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")
-        
-        # Initialize dQ accumulator
-        dq_acc = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
-        
-        # Compute number of key tiles
-        num_k_tiles = tl.cdiv(N_KEYS, K_TILE_SIZE)
-        
-        # Loop over key tiles without using break
-        for j in range(num_k_tiles):
-            k_start = j * K_TILE_SIZE
-            k_end = tl.minimum(k_start + K_TILE_SIZE, N_KEYS)
+        for q_tile_id in range(num_q_tiles):
+            q_start = q_tile_id * Q_TILE_SIZE
+            q_end = tl.minimum(q_start + Q_TILE_SIZE, N_QUERIES)
             
-            # Check if we should process this tile for causal attention
-            should_process = True
+            # Early termination for causal attention
+            if is_causal and k_start >= q_end:
+                continue
+                
+            # Load Qi, Oi, dOi from global memory
+            Q_block_ptr = tl.make_block_ptr(
+                Q_ptr + batch_id * stride_qb,
+                shape=(N_QUERIES, D),
+                strides=(stride_qq, stride_qd),
+                offsets=(q_start, 0),
+                block_shape=(Q_TILE_SIZE, D),
+                order=(1, 0),
+            )
+            
+            O_block_ptr = tl.make_block_ptr(
+                O_ptr + batch_id * stride_ob,
+                shape=(N_QUERIES, D),
+                strides=(stride_oq, stride_od),
+                offsets=(q_start, 0),
+                block_shape=(Q_TILE_SIZE, D),
+                order=(1, 0),
+            )
+            
+            dO_block_ptr = tl.make_block_ptr(
+                dO_ptr + batch_id * stride_dob,
+                shape=(N_QUERIES, D),
+                strides=(stride_doq, stride_dod),
+                offsets=(q_start, 0),
+                block_shape=(Q_TILE_SIZE, D),
+                order=(1, 0),
+            )
+            
+            L_block_ptr = tl.make_block_ptr(
+                L_ptr + batch_id * stride_lb,
+                shape=(N_QUERIES,),
+                strides=(stride_lq,),
+                offsets=(q_start,),
+                block_shape=(Q_TILE_SIZE,),
+                order=(0,),
+            )
+            
+            D_block_ptr = tl.make_block_ptr(
+                D_ptr + batch_id * stride_db,
+                shape=(N_QUERIES,),
+                strides=(stride_dq_idx,),
+                offsets=(q_start,),
+                block_shape=(Q_TILE_SIZE,),
+                order=(0,),
+            )
+            
+            # Load all required tensors
+            q_i = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            o_i = tl.load(O_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            do_i = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            L_i = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")
+            D_i = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")
+            
+            # Compute tile of attention scores: S_i^(j) = Q_i (K^(j))^T / sqrt(d)
+            s_ij = tl.dot(q_i, tl.trans(k_j)) * scale
+            
+            # Apply causal mask if needed
             if is_causal:
-                should_process = k_start < q_end
+                q_indices = q_start + tl.arange(0, Q_TILE_SIZE)
+                k_indices = k_start + tl.arange(0, K_TILE_SIZE)
+                causal_mask = q_indices[:, None] < k_indices[None, :]
+                s_ij = tl.where(causal_mask, -1e6, s_ij)
             
-            # Only process if the condition is met
-            if should_process:
-                # Key/Value block pointers
-                K_block_ptr = tl.make_block_ptr(
-                    K_ptr + batch_index * stride_kb,
-                    shape=(N_KEYS, D),
-                    strides=(stride_kk, stride_kd),
-                    offsets=(k_start, 0),
-                    block_shape=(K_TILE_SIZE, D),
-                    order=(1, 0),
-                )
-                
-                V_block_ptr = tl.make_block_ptr(
-                    V_ptr + batch_index * stride_vb,
-                    shape=(N_KEYS, D),
-                    strides=(stride_vk, stride_vd),
-                    offsets=(k_start, 0),
-                    block_shape=(K_TILE_SIZE, D),
-                    order=(1, 0),
-                )
-                
-                dK_block_ptr = tl.make_block_ptr(
-                    dK_ptr + batch_index * stride_dkb,
-                    shape=(N_KEYS, D),
-                    strides=(stride_dkk, stride_dkd),
-                    offsets=(k_start, 0),
-                    block_shape=(K_TILE_SIZE, D),
-                    order=(1, 0),
-                )
-                
-                dV_block_ptr = tl.make_block_ptr(
-                    dV_ptr + batch_index * stride_dvb,
-                    shape=(N_KEYS, D),
-                    strides=(stride_dvk, stride_dvd),
-                    offsets=(k_start, 0),
-                    block_shape=(K_TILE_SIZE, D),
-                    order=(1, 0),
-                )
-                
-                # Load key/value tiles
-                k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
-                v = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
-                
-                # Recompute attention scores (S_ij = Q_i @ K_j^T * scale)
-                s_ij = tl.dot(q, tl.trans(k)) * scale
-                
-                # Apply causal mask if needed
-                if is_causal:
-                    q_indices = q_start + tl.arange(0, Q_TILE_SIZE)
-                    k_indices = k_start + tl.arange(0, K_TILE_SIZE)
-                    causal_mask = q_indices[:, None] < k_indices[None, :]
-                    s_ij = tl.where(causal_mask, -1e6, s_ij)
-                
-                # Recompute attention weights using online softmax
-                # P_ij = exp(S_ij - L_i)
-                p_ij = tl.exp(s_ij - L_i[:, None])
-                
-                # Compute dV_j += P_ij^T @ dO_i
-                dv_j = tl.dot(tl.trans(p_ij.to(do.dtype)), do)
-                
-                # Load existing dV and accumulate
-                dv_existing = tl.load(dV_block_ptr, boundary_check=(0, 1), padding_option="zero")
-                dv_new = dv_existing + dv_j
-                tl.store(dV_block_ptr, dv_new.to(dV_block_ptr.type.element_ty), boundary_check=(0, 1))
-                
-                # Compute dP_ij = dO_i @ V_j^T
-                dp_ij = tl.dot(do, tl.trans(v))
-                
-                # Compute dS_ij = P_ij * (dP_ij - D_i)
-                ds_ij = p_ij * (dp_ij.to(p_ij.dtype) - D_i[:, None])
-                
-                # Apply causal mask to gradients
-                if is_causal:
-                    ds_ij = tl.where(causal_mask, 0.0, ds_ij)
-                
-                # Accumulate dQ_i += dS_ij @ K_j * scale
-                dq_acc += tl.dot(ds_ij.to(k.dtype), k) * scale
-                
-                # Compute dK_j += dS_ij^T @ Q_i * scale
-                dk_j = tl.dot(tl.trans(ds_ij.to(q.dtype)), q) * scale
-                
-                # Load existing dK and accumulate
-                dk_existing = tl.load(dK_block_ptr, boundary_check=(0, 1), padding_option="zero")
-                dk_new = dk_existing + dk_j
-                tl.store(dK_block_ptr, dk_new.to(dK_block_ptr.type.element_ty), boundary_check=(0, 1))
+            # Compute attention probabilities: P_i^(j) = exp(S_i^(j) - L_i)
+            p_ij = tl.exp(s_ij - L_i[:, None])
+            
+            # Compute dV^(j) += (P_i^(j))^T dO_i
+            dv_j += tl.dot(tl.trans(p_ij.to(do_i.dtype)), do_i)
+            
+            # Compute dP_i^(j) = dO_i V_j^T  
+            dp_ij = tl.dot(do_i, tl.trans(v_j))
+            
+            # Compute dS_i^(j) = P_i^(j) ◦ (dP_i^(j) - D_i) / sqrt(d)
+            ds_ij = p_ij * (dp_ij.to(p_ij.dtype) - D_i[:, None]) * scale
+            
+            # Apply causal mask to gradients
+            if is_causal:
+                ds_ij = tl.where(causal_mask, 0.0, ds_ij)
+            
+            # Load dQ_i from global memory, update dQ_i += dS_i^(j) K^(j), write back
+            # This must be atomic for correctness!
+            dQ_block_ptr = tl.make_block_ptr(
+                dQ_ptr + batch_id * stride_dqb,
+                shape=(N_QUERIES, D),
+                strides=(stride_dqq, stride_dqd),
+                offsets=(q_start, 0),
+                block_shape=(Q_TILE_SIZE, D),
+                order=(1, 0),
+            )
+            
+            # Load existing dQ_i
+            dq_i = tl.load(dQ_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            
+            # Update: dQ_i += dS_i^(j) K^(j)
+            dq_i += tl.dot(ds_ij.to(k_j.dtype), k_j)
+            
+            # Write back to global memory (atomic)
+            tl.store(dQ_block_ptr, dq_i.to(dQ_block_ptr.type.element_ty), boundary_check=(0, 1))
+            
+            # Compute dK^(j) += (dS_i^(j))^T Q_i
+            dk_j += tl.dot(tl.trans(ds_ij.to(q_i.dtype)), q_i)
         
-        # Store final dQ
-        tl.store(dQ_block_ptr, dq_acc.to(dQ_block_ptr.type.element_ty), boundary_check=(0, 1))
-
+        # Write dK^(j) and dV^(j) to global memory as the j-th tiles of dK and dV
+        dK_block_ptr = tl.make_block_ptr(
+            dK_ptr + batch_id * stride_dkb,
+            shape=(N_KEYS, D),
+            strides=(stride_dkk, stride_dkd),
+            offsets=(k_start, 0),
+            block_shape=(K_TILE_SIZE, D),
+            order=(1, 0),
+        )
+        
+        dV_block_ptr = tl.make_block_ptr(
+            dV_ptr + batch_id * stride_dvb,
+            shape=(N_KEYS, D),
+            strides=(stride_dvk, stride_dvd),
+            offsets=(k_start, 0),
+            block_shape=(K_TILE_SIZE, D),
+            order=(1, 0),
+        )
+        
+        tl.store(dK_block_ptr, dk_j.to(dK_block_ptr.type.element_ty), boundary_check=(0, 1))
+        tl.store(dV_block_ptr, dv_j.to(dV_block_ptr.type.element_ty), boundary_check=(0, 1))
+    
     class FlashAttentionTritonAll(torch.autograd.Function):
         """
         Enhanced Triton implementation of FlashAttention-2 with optimized backward pass.
@@ -717,7 +720,6 @@ if TRITON_AVAILABLE:
         
         @staticmethod
         def forward(ctx, Q, K, V, is_causal=False):
-            """使用相同的Triton前向传播算子"""
             batch_size, seq_len, head_dim = Q.shape
             device = Q.device
             dtype = Q.dtype
@@ -743,7 +745,7 @@ if TRITON_AVAILABLE:
             O = torch.empty_like(Q)
             L = torch.empty(batch_size, seq_len, device=device, dtype=torch.float32)
             
-            # Launch forward kernel (使用相同的前向算子)
+            # Launch kernel
             num_q_tiles = triton.cdiv(seq_len, Q_TILE_SIZE)
             grid = (num_q_tiles, batch_size)
             
@@ -763,17 +765,25 @@ if TRITON_AVAILABLE:
                 num_stages=2,
             )
             
-            # Save for backward
             ctx.save_for_backward(Q, K, V, O, L)
             ctx.is_causal = is_causal
             ctx.scale = scale
-            ctx.Q_TILE_SIZE = Q_TILE_SIZE
+            ctx.Q_TILE_SIZE = Q_TILE_SIZE  # Save tile sizes to context
             ctx.K_TILE_SIZE = K_TILE_SIZE
             
             return O
         
         @staticmethod
         def backward(ctx, grad_output):
+            """
+            Algorithm 2: Tiled FlashAttention-2 backward pass using Triton kernel.
+            
+            This implementation follows the exact algorithm structure:
+            1. Compute D = rowsum(dO ◦ O) 
+            2. Outer loop over K/V tiles (j)
+            3. Inner loop over Q tiles (i) for each K/V tile
+            4. Atomic updates for dQ accumulation
+            """
             Q, K, V, O, L = ctx.saved_tensors
             is_causal = ctx.is_causal
             scale = ctx.scale
@@ -782,41 +792,54 @@ if TRITON_AVAILABLE:
             
             batch_size, seq_len, head_dim = Q.shape
             device = Q.device
-            dtype = Q.dtype
             
             # Ensure contiguous gradients
             grad_output = grad_output.contiguous()
             
-            # Pre-compute D vector: D_i = sum_j(dO_ij * O_ij)
+            # Algorithm 2, Step 1: Compute D = rowsum(dO ◦ O)
             D = torch.sum(grad_output * O, dim=-1)  # (batch, seq_len)
             
-            # Initialize gradient tensors
+            # Initialize gradient tensors (Algorithm 2 initialization)
             dQ = torch.zeros_like(Q)
             dK = torch.zeros_like(K)
             dV = torch.zeros_like(V)
             
-            # Launch backward kernel
-            num_q_tiles = triton.cdiv(seq_len, Q_TILE_SIZE)
-            grid = (num_q_tiles, batch_size)
+            # Algorithm 2: Outer loop over K/V tiles (j = 1, ..., Tk)
+            num_k_tiles = triton.cdiv(seq_len, K_TILE_SIZE)
+            grid = (num_k_tiles, batch_size)
             
-            flash_bwd_kernel[grid](
-                Q, K, V, O, grad_output, L,
-                dQ, dK, dV, D,
+            # Launch the Algorithm 2 backward kernel
+            flash_bwd_kernel_v2[grid](
+                Q, K, V, O, grad_output, L, D,
+                dQ, dK, dV,
+                # Q strides
                 Q.stride(0), Q.stride(1), Q.stride(2),
+                # K strides  
                 K.stride(0), K.stride(1), K.stride(2),
+                # V strides
                 V.stride(0), V.stride(1), V.stride(2),
+                # O strides
                 O.stride(0), O.stride(1), O.stride(2),
+                # dO strides
                 grad_output.stride(0), grad_output.stride(1), grad_output.stride(2),
+                # L strides
                 L.stride(0), L.stride(1),
-                dQ.stride(0), dQ.stride(1), dQ.stride(2),
-                dK.stride(0), dK.stride(1), dK.stride(2),
-                dV.stride(0), dV.stride(1), dV.stride(2),
+                # D strides
                 D.stride(0), D.stride(1),
+                # dQ strides
+                dQ.stride(0), dQ.stride(1), dQ.stride(2),
+                # dK strides
+                dK.stride(0), dK.stride(1), dK.stride(2),
+                # dV strides
+                dV.stride(0), dV.stride(1), dV.stride(2),
+                # Problem size
                 seq_len, seq_len, scale,
+                # Compile-time constants
                 D=head_dim,
                 Q_TILE_SIZE=Q_TILE_SIZE,
                 K_TILE_SIZE=K_TILE_SIZE,
                 is_causal=is_causal,
+                # Triton launch parameters
                 num_warps=4,
                 num_stages=2,
             )
