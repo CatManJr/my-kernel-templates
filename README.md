@@ -28,7 +28,7 @@ They are implemented with a Triton forward kernel and a torch backward function.
 | **FA2_CrossTest** | 0.03x | 0.15x | seq_len=128, head_dim=64 |
 | **FA2_FULL_CrossTest** | 0.43x | 0.68x | seq_len=256, head_dim=64 |
 
-#### FA-2 vs FA-2-FULL Backward Pass Comparison
+#### FA-2 vs FA-2-FULL Backward Comparison
 
 | Configuration | FA-2 | FA-2-FULL | Winner | Speedup |
 |---|---|---|---|---|
@@ -37,7 +37,7 @@ They are implemented with a Triton forward kernel and a torch backward function.
 | seq_len=2048, head_dim=32 | 645.34ms | 1.35ms | **FA-2-FULL** | **477.32x** |
 | seq_len=2048, head_dim=64 | 626.05ms | 1.67ms | **FA-2-FULL** | **375.88x** |
 
-> **Conclusion**: The FlashAttention-2 FULL with Triton backward pass is much faster than FlashAttention-2's manual PyTorch backward pass. However, it's slower than the backward pass in PyTorch's built-in functions. Also, the manually implemented FlashAttention-2 forward propagation operator is faster than PyTorch's native multi-head attention. 🌟
+> **Conclusion**: The FlashAttention-2 FULL with Triton backward is much faster than FlashAttention-2's manual PyTorch backward. However, it's slower than the backward in PyTorch's built-in functions. Also, the manually implemented FlashAttention-2 forward propagation operator is faster than PyTorch's native multi-head attention. 🌟
 
 ### Long-term project (from June 3, 2025): LeetGPU :hourglass_flowing_sand:
 I am also solving challenges on [`LeetGPU`](https://leetgpu.com/challenges). I plan to gradually move my solutions here as learning notes. 
