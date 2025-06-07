@@ -3,6 +3,11 @@ FlashAttention-2 implementation in PyTorch and Triton.
 
 This module implements the FlashAttention-2 algorithm for efficient attention computation
 with reduced memory usage through tiling and online softmax computation.
+
+Provide 3 versions: A PyTorch version (very slow), 
+                    A Triton forward + PyTorch backward version,
+                    and A full Triton version.
+I modified the Triton backward kernel from Dao-AILab to my full triton version. The original file is in "ref".
 """
 
 import math
