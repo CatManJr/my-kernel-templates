@@ -19,6 +19,9 @@ import pandas as pd
 from dataclasses import dataclass
 import time
 
+# Enable TF32 for better float32 matrix multiplication performance
+torch.set_float32_matmul_precision('high')
+
 
 @dataclass
 class OptimizedBenchmarkConfig:
