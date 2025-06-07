@@ -21,11 +21,11 @@ You can run the benchmark with:
 ```bash
 uv run utils/run_benchmark.py
 ```
-## Features of Flash Attention 2 Triton Kernels
+## Different Implementations of Flash Attention 2
 
 FA-2 and FA-2 FULL share the same forward kernel implementation, but FA-2 FULL incorporates a Triton backward kernel for enhanced performance.
 
-#### Backward Pass Performance vs PyTorch
+### Backward Pass Performance vs PyTorch
 
 | Implementation | Average Speedup | Max Speedup | Best Configuration |
 |---|---|---|---|
@@ -34,7 +34,7 @@ FA-2 and FA-2 FULL share the same forward kernel implementation, but FA-2 FULL i
 | **FA2_CrossTest** | 0.03x | 0.15x | seq_len=128, head_dim=64 |
 | **FA2_FULL_CrossTest** | 0.43x | 0.68x | seq_len=256, head_dim=64 |
 
-#### FA-2 vs FA-2-FULL Backward Pass Comparison
+### FA-2 vs FA-2-FULL Backward Pass Comparison
 
 | Configuration | FA-2 | FA-2-FULL | Winner | Speedup |
 |---|---|---|---|---|
