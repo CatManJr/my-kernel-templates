@@ -1,5 +1,5 @@
 """
-FlashAttention-1 implementation in Triton.
+FlashAttention-1 implementation with Triton for forward and PyTorch for backward.
 
 This module implements the original FlashAttention algorithm for efficient attention computation
 with reduced memory usage through tiling and online softmax computation.
