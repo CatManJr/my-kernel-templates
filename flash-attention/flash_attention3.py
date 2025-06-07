@@ -3,37 +3,37 @@ FlashAttention-3 implementation in PyTorch and Triton.
 
 ✅ SUCCESSFULLY IMPLEMENTED FA-3 FEATURES:
 
-1. **Enhanced Numerical Stability**
+1. Enhanced Numerical Stability
    - Mixed precision computation (fp32 for critical ops, bf16 for GEMM)
    - Conservative exponential clamping (max_exp = 80.0 vs 88.0)
    - Safer initialization values (-1e9 instead of -inf)
    - Division-by-zero protection (1e-10 minimum thresholds)
 
-2. **Multi-Stage Pipeline Processing**
+2. Multi-Stage Pipeline Processing
    - Configurable NUM_STAGES (2-4 stages) for data prefetching
    - Pipeline buffers for K/V tiles to simulate async loading
    - Prefetch pattern implementation for overlapped computation
    - Stage-aware data loading with fallback mechanisms
 
-3. **Adaptive Tile Sizing & Hardware Optimization**
+3. Adaptive Tile Sizing & Hardware Optimization
    - Sequence-length aware tile size selection (128→32 for long seqs)
    - Power-of-2 tile size enforcement for optimal memory access
    - Dynamic warp count and pipeline stage adjustment
    - Hardware-conscious memory layout (order=(1,0) for coalescing)
 
-4. **Advanced Memory Access Patterns**
+4. Advanced Memory Access Patterns
    - Optimized block pointer configuration for memory coalescing
    - Vectorized causal mask generation (broadcasting vs loops)
    - Contiguous memory layout enforcement
    - Boundary-aware loading with padding_option="zero"
 
-5. **Low-Rank Approximation for Ultra-Long Sequences**
+5. Low-Rank Approximation for Ultra-Long Sequences
    - SVD-based attention matrix approximation for seq_len > 8192
    - Sample-based efficiency optimization (1024 samples max)
    - Rank-adaptive projection (default rank=64)
    - Graceful fallback to standard attention for shorter sequences
 
-6. **Enhanced Online Softmax Algorithm**
+6. Enhanced Online Softmax Algorithm**
    - Improved overflow/underflow protection
    - Safer accumulator update formulas
    - Better normalization stability
@@ -47,35 +47,35 @@ FlashAttention-3 implementation in PyTorch and Triton.
 
 ❌ CANNOT IMPLEMENT IN TRITON/PYTORCH (Require Custom CUDA):
 
-1. **True Warp Specialization**
+1. True Warp Specialization
    - Hardware-level producer/consumer warp assignment
    - Cross-warp communication and synchronization primitives
    - Dynamic workload balancing between warps
    - Warp-level shared memory coordination
    Reason: Triton abstracts away low-level warp management
 
-2. **Hardware-Level Async Memory Operations**
+2. Hardware-Level Async Memory Operations
    - True async memory copy with DMA engines
    - Computation-memory overlap at instruction level
    - Hardware prefetch instructions (ldg.ca, etc.)
    - CUDA streams for genuine pipeline parallelism
    Reason: Triton doesn't expose hardware async primitives
 
-3. **Dynamic Kernel Parameter Adjustment**
+3. Dynamic Kernel Parameter Adjustment
    - Runtime tile size adaptation based on occupancy
    - Dynamic shared memory allocation
    - Adaptive thread block sizing
    - Runtime kernel recompilation
    Reason: Triton kernels are statically compiled
 
-4. **Advanced Memory Hierarchy Optimizations**
+4. Advanced Memory Hierarchy Optimizations
    - Explicit L1/L2 cache management
    - Texture memory usage for read-only data
    - Shared memory bank conflict avoidance
    - Manual register allocation optimization
    Reason: Triton manages memory hierarchy automatically
 
-5. **Cross-SM Communication**
+5. Cross-SM Communication
    - Inter-block synchronization beyond grid-level
    - Global memory coherency operations
    - Device-wide reduction operations
