@@ -973,7 +973,7 @@ def run_fa2_full_focused_benchmark():
             fwd_winner = "FA-2-FULL" if fwd_speedup > 1.0 else "PyTorch"
             bwd_winner = "FA-2-FULL" if bwd_speedup > 1.0 else "PyTorch"
             
-            print(f"{config_name:<20} {fwd_speedup:.2f}x<-15} {bwd_speedup:.2f}x<-16} {total_speedup:.2f}x<-15} {fwd_winner:<15} {bwd_winner:<15}")
+            print(f"{config_name:<20} {fwd_speedup:.2f}x{'':<15} {bwd_speedup:.2f}x{'':<16} {total_speedup:.2f}x{'':<15} {fwd_winner:<15} {bwd_winner:<15}")
         else:
             print(f"{config_name:<20} {'N/A':<15} {'N/A':<16} {'N/A':<15} {'N/A':<15} {'N/A':<15}")
     

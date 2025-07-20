@@ -25,22 +25,33 @@ uv run utils/run_benchmark.py
 
 FA-2 and FA-2 FULL share the same forward kernel implementation, but FA-2 FULL incorporates a Triton backward kernel for enhanced performance.
 
-### Backward Pass Performance vs PyTorch
+### Backward Pass Performance Comparison (vs PyTorch)
 
-| Implementation | Average Speedup | Max Speedup | Best Configuration |
-|---|---|---|---|
-| **FlashAttention2_Triton** | 0.00x | 0.00x | seq_len=1024, head_dim=64 |
-| **FlashAttention2_FULL** | 0.41x | 0.48x | seq_len=1024, head_dim=64 |
-| **FA2_CrossTest** | 0.03x | 0.15x | seq_len=128, head_dim=64 |
-| **FA2_FULL_CrossTest** | 0.43x | 0.68x | seq_len=256, head_dim=64 |
+| Configuration | FA-2 Backward | FA-2-FULL Backward | PyTorch Backward | FA-2 vs PyTorch | FA-2-FULL vs PyTorch |
+|---|---|---|---|---|---|
+| seq_len=1024, head_dim=32 | 162.99ms | 1.33ms | 0.63ms | 0.004x | 0.47x |
+| seq_len=1024, head_dim=64 | 160.83ms | 1.71ms | 0.68ms | 0.004x | 0.40x |
+| seq_len=2048, head_dim=32 | 647.28ms | 1.38ms | 0.50ms | 0.001x | 0.36x |
+| seq_len=2048, head_dim=64 | 629.93ms | 1.75ms | 0.54ms | 0.001x | 0.31x |
 
 ### FA-2 vs FA-2-FULL Backward Pass Comparison
 
 | Configuration | FA-2 | FA-2-FULL | Winner | Speedup |
 |---|---|---|---|---|
-| seq_len=1024, head_dim=32 | 169.97ms | 1.17ms | **FA-2-FULL** | **144.80x** |
-| seq_len=1024, head_dim=64 | 162.84ms | 1.39ms | **FA-2-FULL** | **117.21x** |
-| seq_len=2048, head_dim=32 | 645.34ms | 1.35ms | **FA-2-FULL** | **477.32x** |
-| seq_len=2048, head_dim=64 | 626.05ms | 1.67ms | **FA-2-FULL** | **375.88x** |
+| seq_len=1024, head_dim=32 | 162.99ms | 1.33ms | **FA-2-FULL** | **122.69x** |
+| seq_len=1024, head_dim=64 | 160.83ms | 1.71ms | **FA-2-FULL** | **94.28x** |
+| seq_len=2048, head_dim=32 | 647.28ms | 1.38ms | **FA-2-FULL** | **468.33x** |
+| seq_len=2048, head_dim=64 | 629.93ms | 1.75ms | **FA-2-FULL** | **359.30x** |
 
-> **Key Insight**: The results demonstrate the significant performance benefits of implementing custom Triton kernels for backward passes. However, forward pass performance still lags behind PyTorch implementations, highlighting the continued importance of CUDA for fine-grained GPU operations.
+> **Summary**: The results demonstrate the significant performance benefits of implementing custom Triton kernels for backward passes. FA-2-FULL achieves 94x-468x speedups in backward pass compared to FA-2's PyTorch backward implementation. I used more operations and storage to fit in DaoAI's backward kernel, so there still exist large performance gaps to PyTorch API.
+
+### Forward Pass Performance vs PyTorch
+
+| Configuration | FA-2 | FA-2-FULL | FA-2 Speedup | FA-2-FULL Speedup |
+|---|---|---|---|---|
+| seq_len=1024, head_dim=32 | 0.41ms | 0.65ms | 1.12x | 0.71x |
+| seq_len=1024, head_dim=64 | 0.47ms | 1.00ms | 0.94x | 0.44x |
+| seq_len=2048, head_dim=32 | 0.46ms | 1.78ms | 1.16x | 0.30x |
+| seq_len=2048, head_dim=64 | 0.61ms | 0.92ms | 0.94x | 0.63x |
+
+> **Summary**: FA-2-FULL's forward pass shows problems from pure Triton implementation. Because I used more operations and storage to fit in DaoAI's backward kernel, FA-2's Triton forward offers better forward pass performance although they both use the same forward kernel.
