@@ -33,7 +33,7 @@ def run_quick_optimized_benchmark():
     # Create quick config with fewer test cases
     config = OptimizedBenchmarkConfig(
         short_sequences=[128, 256],          # FA-1 strength (reduced)
-        medium_sequences=[256, 512],       # FA-2 strength (reduced)  
+        medium_sequences=[256, 512],         # FA-2 strength (reduced)  
         long_sequences=[1024, 2048],         # FA-3 using same as FA-2 to avoid hanging
         head_dims=[64],                      # Focus on common head_dim
         fa1_dtypes=[torch.float32],          # Only FP32
@@ -49,7 +49,7 @@ def run_quick_optimized_benchmark():
     
     benchmarker = FlashAttentionBenchmarker(config)
     
-    print("🚀 Quick Optimized FlashAttention Benchmark")
+    print("Quick Optimized FlashAttention Benchmark")
     print("Focus: Each version tested in its sweet spot")
     print("Reduced configurations for faster execution")
     print()
@@ -57,7 +57,7 @@ def run_quick_optimized_benchmark():
     df = benchmarker.run_optimized_benchmark()
     
     if df.empty:
-        print("❌ Quick benchmark failed")
+        print("Quick benchmark failed")
         return None, None
     
     benchmarker.print_optimized_summary(df)
@@ -175,7 +175,7 @@ def run_custom_optimized_benchmark():
     df = benchmarker.run_optimized_benchmark()
     
     if df.empty:
-        print("❌ Custom benchmark failed")
+        print("Custom benchmark failed")
         return None, None
         
     benchmarker.print_optimized_summary(df)
@@ -226,16 +226,16 @@ def run_version_comparison():
     df = benchmarker.run_optimized_benchmark()
     
     if df.empty:
-        print("❌ Version comparison failed")
+        print("Version comparison failed")
         return None, None
     
     # Custom analysis for version comparison
     print("\n" + "=" * 100)
-    print("🏆 FLASHATTENTION VERSION COMPARISON ANALYSIS")
+    print("FLASHATTENTION VERSION COMPARISON ANALYSIS")
     print("=" * 100)
     
     # Analyze each version at its optimal condition
-    print("\n📊 OPTIMAL PERFORMANCE ANALYSIS:")
+    print("\nOPTIMAL PERFORMANCE ANALYSIS:")
     print("-" * 60)
     
     optimal_conditions = [
@@ -307,12 +307,12 @@ def run_precision_analysis():
     df = benchmarker.run_optimized_benchmark()
     
     if df.empty:
-        print("❌ Precision analysis failed")
+        print("Precision analysis failed")
         return None, None
     
     # Custom precision analysis
     print("\n" + "=" * 100)
-    print("🔬 PRECISION IMPACT ANALYSIS")
+    print("PRECISION IMPACT ANALYSIS")
     print("=" * 100)
     
     versions = [
@@ -346,10 +346,10 @@ def run_precision_analysis():
 def main():
     """Main optimized benchmark runner with multiple options."""
     if not torch.cuda.is_available():
-        print("❌ CUDA is not available. This benchmark requires a CUDA-enabled GPU.")
+        print("CUDA is not available. This benchmark requires a CUDA-enabled GPU.")
         return
     
-    print("🎯 FlashAttention Optimized Benchmark Suite")
+    print("FlashAttention Optimized Benchmark Suite")
     print("Focus: Each version tested in its optimal conditions")
     print("=" * 60)
     print("1. Quick Optimized Benchmark (fast, each version's strengths)")
@@ -363,37 +363,37 @@ def main():
     
     try:
         if choice == "1":
-            print("\n🚀 Running Quick Optimized Benchmark...")
+            print("\nRunning Quick Optimized Benchmark...")
             df, benchmarker = run_quick_optimized_benchmark()
         elif choice == "2":
-            print("\n🌟 Running Full Optimized Benchmark...")
+            print("\nRunning Full Optimized Benchmark...")
             df, benchmarker = run_flashattention_optimized_benchmark()
         elif choice == "3":
-            print("\n🏆 Running Version Comparison...")
+            print("\nRunning Version Comparison...")
             df, benchmarker = run_version_comparison()
         elif choice == "4":
-            print("\n🔬 Running Precision Analysis...")
+            print("\nRunning Precision Analysis...")
             df, benchmarker = run_precision_analysis()
         elif choice == "5":
-            print("\n⚙️ Running Custom Optimized Benchmark...")
+            print("\nRunning Custom Optimized Benchmark...")
             df, benchmarker = run_custom_optimized_benchmark()
         else:
             print("Invalid choice. Running Quick Optimized Benchmark by default.")
             df, benchmarker = run_quick_optimized_benchmark()
     except Exception as e:
-        print(f"❌ Benchmark failed with error: {e}")
+        print(f"Benchmark failed with error: {e}")
         import traceback
         traceback.print_exc()
         return
     
     if df is None or df.empty:
-        print("❌ No benchmark results generated")
+        print("No benchmark results generated")
         return
     
-    print("\n✅ Benchmark completed successfully!")
+    print("\nBenchmark completed successfully!")
     
     # Option to save detailed results
-    save = input("\n💾 Save detailed results to CSV? (y/N): ").strip().lower()
+    save = input("\nSave detailed results to CSV? (y/N): ").strip().lower()
     if save in ['y', 'yes']:
         import time
         timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -401,10 +401,10 @@ def main():
         benchmarker.save_results(df, filename)
     
     # Option to show best configurations
-    best = input("📈 Show best configuration for each sequence length? (y/N): ").strip().lower()
+    best = input("Show best configuration for each sequence length? (y/N): ").strip().lower()
     if best in ['y', 'yes']:
         print("\n" + "=" * 100)
-        print("🏆 BEST CONFIGURATION SUMMARY")
+        print("BEST CONFIGURATION SUMMARY")
         print("=" * 100)
         
         # Group by sequence length and find best implementation
